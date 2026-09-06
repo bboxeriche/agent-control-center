@@ -1,0 +1,27 @@
+{
+  "name": "agent-control-center",
+  "version": "0.1.0+codex.20260906125735",
+  "description": "Run and coordinate local coding agents from Codex with durable events and minutes.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Control Center",
+    "shortDescription": "Dispatch and review local coding agents.",
+    "longDescription": "Coordinate Antigravity, Claude Code, Codex CLI, and Tencent CodeBuddy from Codex through a local control service. Tasks, events, discussions, and minutes remain on the host.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Check the local agent status",
+      "Start a Codex CLI task for this repository",
+      "Hold a two-round discussion and save the minutes"
+    ],
+    "brandColor": "#2563EB"
+  },
+  "mcpServers": "./.mcp.json"
+}

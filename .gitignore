@@ -1,0 +1,13 @@
+node_modules/
+.DS_Store
+
+# Local runtime state
+auth.token
+control.sqlite
+control.sqlite-shm
+control.sqlite-wal
+events.jsonl
+minutes/
+
+# Local overrides
+config.json

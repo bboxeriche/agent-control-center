@@ -1,0 +1,48 @@
+{
+  "host": "127.0.0.1",
+  "port": 47770,
+  "defaultCwd": "/absolute/path/to/your/repository",
+  "allowedRoots": ["/absolute/path/to/your"],
+  "maxConcurrentTasks": 4,
+  "defaultTimeoutMs": 1800000,
+  "maxWaitMs": 60000,
+  "maxPromptChars": 20000,
+  "agents": {
+    "antigravity": {
+      "kind": "cli",
+      "command": "agy",
+      "args": ["-p", "{prompt}", "--output-format", "stream-json"],
+      "modelArgs": ["--model", "{model}"],
+      "supportsResume": false
+    },
+    "claude-code": {
+      "kind": "cli",
+      "command": "claude",
+      "args": ["-p", "{prompt}", "--output-format", "stream-json", "--verbose"],
+      "modelArgs": ["--model", "{model}"],
+      "resumeArgs": ["-p", "{prompt}", "--resume", "{sessionId}", "--output-format", "stream-json", "--verbose"],
+      "supportsResume": true
+    },
+    "codex-cli": {
+      "kind": "cli",
+      "command": "codex",
+      "args": ["exec", "--json", "--skip-git-repo-check", "--sandbox", "workspace-write", "--config", "model_reasoning_effort=\"max\"", "--cd", "{cwd}", "{prompt}"],
+      "modelArgs": ["--model", "{model}"],
+      "resumeArgs": ["exec", "resume", "--json", "--skip-git-repo-check", "--config", "model_reasoning_effort=\"max\"", "{sessionId}", "{prompt}"],
+      "defaultModel": "gpt-5.6-luna",
+      "stdin": "ignore",
+      "permissionMapping": { "flag": "--sandbox", "writeAllowed": "workspace-write", "writeDenied": "read-only" },
+      "supportsResume": true
+    },
+    "tencent-workbuddy": {
+      "kind": "http-or-cli",
+      "command": "codebuddy",
+      "args": ["-p", "{prompt}", "--output-format", "stream-json", "--verbose"],
+      "modelArgs": ["--model", "{model}"],
+      "resumeArgs": ["-p", "{prompt}", "--resume", "{sessionId}", "--output-format", "stream-json", "--verbose"],
+      "httpUrl": "",
+      "tokenEnv": "WORKBUDDY_HTTP_TOKEN",
+      "supportsResume": true
+    }
+  }
+}

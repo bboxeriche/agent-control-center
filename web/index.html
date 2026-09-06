@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Control Center</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">LOCAL CONTROL PLANE</p>
+        <h1>Agent Control Center</h1>
+        <p class="subtitle">把本机 Agent 的派工、讨论和纪要收进一条可追溯的工作流。</p>
+      </div>
+      <div class="header-status">
+        <div class="service-state" id="service-state" role="status" aria-live="polite">连接中…</div>
+        <p class="header-note">本机服务 · 记录保存在当前主机</p>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel providers-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">PROVIDERS</p>
+            <h2>Agent 状态</h2>
+          </div>
+          <button class="quiet-button" id="refresh-button" type="button">刷新</button>
+        </div>
+        <p class="panel-copy">每个 Provider 独立探测；不可用的 Agent 不会被当作成功运行。</p>
+        <div class="provider-grid" id="provider-grid"></div>
+      </section>
+
+      <section class="summary-grid" aria-label="工作摘要">
+        <article class="summary-card"><span class="summary-label">进行中任务</span><strong id="running-count">0</strong><span class="summary-note">排队或执行中</span></article>
+        <article class="summary-card"><span class="summary-label">已完成任务</span><strong id="finished-count">0</strong><span class="summary-note">包含失败与停止</span></article>
+        <article class="summary-card"><span class="summary-label">讨论记录</span><strong id="discussion-count-summary">0</strong><span class="summary-note">可继续查看详情</span></article>
+        <article class="summary-card"><span class="summary-label">已保存纪要</span><strong id="minutes-count">0</strong><span class="summary-note">可追溯 Markdown</span></article>
+      </section>
+
+      <section class="form-grid">
+        <form class="panel form-panel" id="task-form">
+          <div class="form-heading"><div><p class="eyebrow">DISPATCH</p><h2>派发单个任务</h2></div><span class="form-kicker">单 Agent</span></div>
+          <p class="panel-copy">把一个边界清楚的任务交给指定 Agent，并保留完整结果。</p>
+          <div class="field"><label for="task-agent">Agent</label><select id="task-agent" name="agent" required></select></div>
+          <div class="field"><label for="task-cwd">工作目录</label><input id="task-cwd" name="cwd" placeholder="/absolute/path/to/repository" aria-describedby="task-cwd-note" /><small id="task-cwd-note">留空则使用服务默认目录。</small></div>
+          <div class="field"><label for="task-prompt">任务指令</label><textarea id="task-prompt" name="prompt" rows="6" placeholder="说明目标、约束和验收方式" required></textarea></div>
+          <div class="form-actions"><button class="primary-button" type="submit">创建任务</button><p class="form-note" id="task-message" role="status" aria-live="polite"></p></div>
+        </form>
+
+        <form class="panel form-panel" id="discussion-form">
+          <div class="form-heading"><div><p class="eyebrow">DISCUSSION</p><h2>多 Agent 讨论</h2></div><span class="form-kicker">最多 3 轮</span></div>
+          <p class="panel-copy">先独立分析，再让下一轮看到上一轮的有限输出并进行批评。</p>
+          <div class="field"><label for="discussion-cwd">工作目录</label><input id="discussion-cwd" name="cwd" placeholder="/absolute/path/to/repository" aria-describedby="discussion-cwd-note" /><small id="discussion-cwd-note">留空则使用服务默认目录。</small></div>
+          <div class="field"><label for="discussion-prompt">讨论问题</label><textarea id="discussion-prompt" name="prompt" rows="5" placeholder="请分析一个架构、实现或决策问题" required></textarea></div>
+          <fieldset><legend>参与 Agent</legend><div class="agent-checks" id="discussion-agents"></div></fieldset>
+          <div class="field"><label for="discussion-rounds">轮次</label><select id="discussion-rounds" name="rounds"><option value="1">1 轮</option><option value="2" selected>2 轮</option><option value="3">3 轮</option></select></div>
+          <div class="form-actions"><button class="primary-button" type="submit">开始讨论</button><p class="form-note" id="discussion-message" role="status" aria-live="polite"></p></div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">TASKS</p>
+            <h2>最近任务</h2>
+          </div>
+          <span class="muted" id="task-count"></span>
+        </div>
+        <div class="item-list" id="task-list"><p class="muted">暂无任务</p></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">DISCUSSIONS</p>
+            <h2>讨论与纪要</h2>
+          </div>
+          <span class="muted" id="discussion-count"></span>
+        </div>
+        <div class="item-list" id="discussion-list"><p class="muted">暂无讨论</p></div>
+      </section>
+    </main>
+    <dialog class="dialog" id="detail-dialog" aria-labelledby="detail-title">
+      <div class="dialog-card"><div class="panel-heading"><h3 id="detail-title">详情</h3><button class="quiet-button" id="close-detail" type="button">关闭</button></div><pre id="detail-content"></pre></div>
+    </dialog>
+    <dialog class="dialog" id="reply-dialog" aria-labelledby="reply-title">
+      <form class="dialog-card" id="reply-form"><div class="panel-heading"><h3 id="reply-title">跟进任务</h3><button class="quiet-button" id="cancel-reply" type="button">取消</button></div><p class="panel-copy">已完成的任务会创建一个带原 session 引用的新任务；支持实时回复的 Provider 会继续当前任务。</p><label for="reply-prompt">跟进指令</label><textarea id="reply-prompt" rows="5" placeholder="补充检查、追问结果或指定下一步" required></textarea><div class="dialog-actions"><button class="primary-button" type="submit">发送跟进</button><p class="form-note" id="reply-message" role="status" aria-live="polite"></p></div></form>
+    </dialog>
+    <dialog class="dialog minutes-dialog" id="minutes-viewer" aria-labelledby="minutes-title">
+      <div class="dialog-card"><div class="panel-heading"><h3 id="minutes-title">纪要</h3><button class="quiet-button" id="close-minutes" type="button">关闭</button></div><pre id="minutes-content"></pre></div>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

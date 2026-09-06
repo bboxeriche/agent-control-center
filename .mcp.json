@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "agent-control-center": {
+      "command": "node",
+      "args": ["server/mcp-server.mjs"],
+      "cwd": ".",
+      "env_vars": [
+        "HOME",
+        "PATH",
+        "AGENT_CONTROL_HOST",
+        "AGENT_CONTROL_PORT",
+        "AGENT_CONTROL_DEFAULT_CWD",
+        "AGENT_CONTROL_DATA_DIR",
+        "AGENT_CONTROL_CONFIG",
+        "AGENT_CONTROL_AUTH_TOKEN",
+        "AGENT_CONTROL_CODEX_COMMAND",
+        "CODEX_HOME",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+        "WORKBUDDY_HTTP_URL",
+        "WORKBUDDY_HTTP_TOKEN"
+      ]
+    }
+  }
+}

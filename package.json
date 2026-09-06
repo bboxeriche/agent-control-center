@@ -1,0 +1,16 @@
+{
+  "name": "agent-control-center",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local control plane and Codex MCP plugin for multiple coding agents.",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "check": "node --check server/*.mjs",
+    "start": "node server/service.mjs",
+    "mcp": "node server/mcp-server.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}
