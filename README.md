@@ -1,82 +1,128 @@
 # Agent Control Center
 
-Agent Control Center gives Codex one controlled entry point for local Antigravity, Claude Code, Codex CLI, and Tencent WorkBuddy/CodeBuddy tasks.
+[![CI](https://github.com/bboxeriche/agent-control-center/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bboxeriche/agent-control-center/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/bboxeriche/agent-control-center)](https://github.com/bboxeriche/agent-control-center/blob/main/LICENSE) [![Release](https://img.shields.io/github/v/release/bboxeriche/agent-control-center?display_name=tag)](https://github.com/bboxeriche/agent-control-center/releases)
 
-The control service runs on `127.0.0.1:47770` by default. It owns task lifecycle, process supervision, provider events, discussion rounds, and durable storage. The Codex plugin exposes the control service through MCP. A small local dashboard is available at `http://127.0.0.1:47770/`.
+ACC is a local durable control plane that gives Codex one controlled interface for supervising multiple coding agents with persistent task identity, observable events, bounded permissions, recovery, and provider-specific capability reporting.
 
-## Start it directly
+## What it is
+
+Agent Control Center (ACC) is a local service, Codex MCP plugin, and small dashboard for coordinating coding-agent processes on one host. It owns task lifecycle, process supervision, provider events, follow-up attempts, discussions, and durable local records.
+
+The service binds to `127.0.0.1:47770` by default. It does not create a public gateway or send unsolicited results to another service.
+
+## Why it exists
+
+Coding agents expose different commands, session identifiers, permission models, and failure signals. ACC gives them a common, observable control surface without pretending that provider capabilities are interchangeable. A task keeps one durable control-plane identity while provider-specific session IDs remain adapter metadata.
+
+## Core capabilities
+
+- Durable task identity, idempotent creation, bounded waiting, event history, and follow-up/resume attempts.
+- Provider adapters for Codex CLI, Claude Code, Antigravity, and Tencent WorkBuddy/CodeBuddy.
+- Task-scoped permission policy, capability snapshots, execution-profile preflight, and mechanical execution-outcome classification.
+- Structured discussions with bounded critique rounds and traceable Markdown minutes.
+- An authenticated loopback API, MCP tools, and a local dashboard.
+- An authenticated DevSpace MCP client for an existing ChatGPT-to-local execution path.
+
+## Architecture
+
+```text
+Codex
+  |
+ MCP
+  v
+Agent Control Center
+  ├─ Codex CLI
+  ├─ Claude Code
+  ├─ Antigravity
+  └─ WorkBuddy
+```
+
+ACC stores the task, provider events, discussions, and generated minutes locally. The control service accepts registered provider commands from configuration; an API request cannot provide an arbitrary command.
+
+## Supported providers
+
+| Provider | Integration | Capability notes |
+| --- | --- | --- |
+| Codex CLI | Structured CLI execution and follow-up | Uses the local Codex installation and its configured authentication. |
+| Claude Code | Configured local CLI | Uses the configured local endpoint and credentials when available. |
+| Antigravity | Headless CLI adapter | macOS external containment is available for the supported profiles described below. |
+| Tencent WorkBuddy/CodeBuddy | CLI or configured HTTP jobs API | The adapter reports unavailable or unhealthy paths explicitly. |
+
+Provider health is independent: an unavailable provider does not prevent the other adapters or the local Codex MCP surface from working.
+
+## Quick start
+
+Prerequisites: Node.js `>=22.5` and the provider CLIs or local endpoints you intend to use.
 
 ```bash
+git clone https://github.com/bboxeriche/agent-control-center.git
+cd agent-control-center
+npm install
+npm run check
+npm test
 npm start
 ```
 
-The service stores its SQLite database, append-only event log, and generated minutes under `~/.codex/agent-control-center` unless `AGENT_CONTROL_DATA_DIR` is set. Set `AGENT_CONTROL_CONFIG` to a JSON configuration file to override executable paths or configure Tencent WorkBuddy's HTTP API.
+The dashboard is available at `http://127.0.0.1:47770/`. Runtime data is stored under `~/.codex/agent-control-center` unless `AGENT_CONTROL_DATA_DIR` is set. Use `AGENT_CONTROL_CONFIG` for a JSON configuration file, `AGENT_CONTROL_DEFAULT_CWD` for a repository-wide default working directory, and `AGENT_CONTROL_ALLOWED_ROOTS` to constrain filesystem scopes. Working directories must be absolute and already exist.
 
-For a repository-wide default working directory, set `AGENT_CONTROL_DEFAULT_CWD` to an absolute path. Every task can also provide its own absolute `cwd`. The service refuses relative or nonexistent working directories.
+The repository includes `.codex-plugin/plugin.json` and `.mcp.json`. To use the MCP surface from a local checkout, register `server/mcp-server.mjs` with `node` and set its working directory to the checkout, for example `/path/to/agent-control-center`.
 
-The local API is authenticated. The service creates `auth.token` under the data directory with mode `0600`; the MCP server reads it automatically, and the loopback dashboard receives an HttpOnly cookie. Keep the default host `127.0.0.1` unless you have separately designed network access controls. Do not expose port `47770` directly to the internet.
+## Security model
 
-## Frozen DevSpace boundary
+- The API is loopback-only by default and requires the generated bearer token. The token is stored with mode `0600`; it is not part of the MCP tool schema or prompt.
+- Provider commands and argument templates come from configuration. Task requests select only a registered provider and cannot submit an arbitrary command.
+- Remote-origin defaults are least privilege at the control-policy layer. Write and network access require an explicit request, an enabled origin ceiling, and a filesystem scope within `allowedRoots`.
+- Capability receipts distinguish native provider enforcement, ACC mapping, external containment, and the effective boundary actually claimed for a task. Unknown executor boundaries are reported as `limited` rather than simulated as native support.
+- Provider output is recorded with common credential patterns redacted. ACC receipts describe requested policy and mechanically observed facts; they do not prove that a model answer is correct or that a product-level acceptance gate has passed.
 
-The current control chain is `Founder → ChatGPT → DevSpace → Agent Control Center → executor`. DevSpace is the existing ChatGPT-to-local execution bridge; the control center does not maintain a ChatGPT session, push to ChatGPT, or start a second gateway. A DevSpace caller should identify itself with `origin: "devspace"` when using the existing local API contract. ChatGPT can create, inspect, wait, follow up, stop, and recover tasks through that path; results are returned when the client asks.
+Antigravity headless permission mapping is fail-closed and task-scoped. On macOS, ACC uses a `sandbox-exec` profile plus a local network proxy for the supported external-containment profiles. The profile permits writes only under the effective task scope, routes network requests through the task proxy, denies common credential-shaped paths by default, and is removed after provider exit, stop, error, or timeout. Persistent Antigravity settings are not edited.
+
+## Known limitations
+
+- Antigravity task-scoped external containment is macOS-specific.
+- Antigravity currently needs broad provider startup reads; a narrower read boundary causes the provider to abort during startup, so the adapter does not claim one.
+- The bounded-write/no-network Antigravity capability quadrant is unsupported and fails closed during preflight because the headless network tool can escape the child-process path.
+- Sensitive credential-shaped paths (`.env*`, `*.pem`, `*.key`, `credentials*`, and `auth*`) are denied by default inside the external profile. A task-scoped override is available only for a disposable, reviewable scope.
+- Provider availability, authentication, model identifiers, and network behavior remain provider-specific. ACC does not make a provider cross-platform or guarantee semantic correctness, prompt-injection resistance, or product acceptance.
+
+## Tested environments
+
+- GitHub Actions runs the check and test suite on `macos-latest` with Node.js 22 and no provider credentials.
+- Local validation targets macOS with Node.js `>=22.5`; the test suite uses fixtures and does not require live provider credentials, private repositories, or an auth token.
+- The current Antigravity containment behavior is validated against the provider version documented in the task receipts; provider versions and model catalogs can change independently.
+
+## Integration details
+
+### Task and event contract
 
 The durable task contract is:
 
-- `taskId` is the control-center execution identity and survives client disconnects and follow-up attempts.
+- `taskId` is the ACC execution identity and survives client disconnects and follow-up attempts.
 - `providerSessionId` and provider job/conversation IDs are adapter metadata only.
 - `idempotencyKey` retries return the existing task and do not spawn another executor.
 - `GET /api/tasks/:taskId/events?afterCursor=N` returns a durable page with `nextCursor` and `hasMore`.
-- `GET /api/tasks/:taskId/wait?timeoutMs=N&afterCursor=N` is bounded by `maxWaitMs` (60 seconds by default) and returns the current task plus observable events. A timeout is a normal snapshot, not a task failure.
+- `GET /api/tasks/:taskId/wait?timeoutMs=N&afterCursor=N` is bounded by `maxWaitMs` (60 seconds by default). A timeout is a normal snapshot, not a task failure.
 
-The same operations are available to Codex through `acc_task_*` MCP tools, including `acc_task_wait`. The existing `after` query/tool field remains a compatibility alias for `afterCursor`.
+The same operations are available through the `acc_task_*` MCP tools, including `acc_task_wait`. The `after` query/tool field remains a compatibility alias for `afterCursor`.
 
-## DevSpace authenticated client
+### DevSpace authenticated client
 
-For the existing `ChatGPT → DevSpace → local` path, register the repository's `server/devspace-mcp-server.mjs` as a local stdio MCP server in DevSpace. Use the command `node` with arguments `server/devspace-mcp-server.mjs` and working directory set to this plugin directory. The adapter starts the local ACC service when needed, reads the local `auth.token` itself, and sends authenticated requests with `x-agent-control-origin: devspace`. The token is never part of the tool schema, prompt, or result.
+The existing control chain is `Founder → ChatGPT → DevSpace → Agent Control Center → executor`. DevSpace is an existing ChatGPT-to-local execution bridge; ACC does not maintain a ChatGPT session, push to ChatGPT, or start a second gateway. A DevSpace caller identifies itself with `origin: "devspace"` when using the local API contract. ChatGPT can create, inspect, wait, follow up, stop, and recover tasks through that path; results are returned when the client asks.
 
-The DevSpace surface intentionally exposes only the semantic `acc_*` operations needed by a GPT leader: health, agents, task create/list/get/wait/events/reply/stop, discussion create/get/events, and minutes generation. It always forces `origin=devspace`; caller-supplied origin values are ignored. Use a stable `idempotencyKey` for task creation retries and a stable `originRequestId` for request tracing. Keep `AGENT_CONTROL_DATA_DIR`, `AGENT_CONTROL_CONFIG`, `AGENT_CONTROL_ALLOWED_ROOTS`, and `AGENT_CONTROL_DEFAULT_CWD` in the local DevSpace process environment; do not put the token in DevSpace configuration or GPT context.
+Register `server/devspace-mcp-server.mjs` as a local stdio MCP server in DevSpace with command `node`, argument `server/devspace-mcp-server.mjs`, and working directory set to the checkout. The adapter starts the local ACC service when needed, reads `auth.token` itself, and sends authenticated requests with `x-agent-control-origin: devspace`. The token is never part of the tool schema, prompt, or result.
 
-## Install the local plugin
+The DevSpace surface exposes only the semantic `acc_*` operations needed by a GPT leader: health, agents, task create/list/get/wait/events/reply/stop, discussion create/get/events, and minutes generation. It forces `origin=devspace`; caller-supplied origin values are ignored. Keep `AGENT_CONTROL_DATA_DIR`, `AGENT_CONTROL_CONFIG`, `AGENT_CONTROL_ALLOWED_ROOTS`, and `AGENT_CONTROL_DEFAULT_CWD` in the local DevSpace process environment rather than in DevSpace configuration or GPT context.
 
-The repository includes a local marketplace at `.agents/plugins/marketplace.json`. After the implementation is validated, add that marketplace to Codex and install `agent-control-center` from it. A new Codex task is required for the newly installed MCP tools to be discovered.
+### Provider-specific notes
 
-```bash
-codex plugin marketplace add /path/to/ke-y
-codex plugin add agent-control-center@agent-control-local
-```
+The Tencent HTTP adapter follows the CodeBuddy jobs contract: it submits `POST /api/v1/jobs`, follows the job SSE stream, and uses the documented `X-CodeBuddy-Request: 1` header. Configure it with `WORKBUDDY_HTTP_URL` and, when required by the local gateway, `WORKBUDDY_HTTP_TOKEN`. The installed CLI name is `codebuddy`; if auto-detection is not applicable, set `AGENT_CONTROL_WORKBUDDY_COMMAND` to an explicit executable path.
 
-After installation, the Codex session can call the MCP tools directly. Codex Remote on a phone can use those same tools through the connected Mac/Windows host; the host must be awake, online, and signed into the same Codex account/workspace. The dashboard itself remains a local visual monitor.
+For CLI tasks, the optional MCP `model` field is passed literally to the provider as `--model`; it is a provider-specific identifier, not a universal alias. Codex CLI defaults to `gpt-5.6-luna` with `model_reasoning_effort="max"`. Antigravity and WorkBuddy model catalogs are provider-specific and should be checked against the installed version.
 
-## Provider states
+Prior local read-only validation succeeded for WorkBuddy with `hy4-preview` and for Antigravity with `gemini-3.8-flash-high`; both returned `ACC_E2E_OK` and persisted provider session IDs and event streams. An earlier Antigravity `FAILED_PRECONDITION (400): User location is not supported for the API use` result was an environmental network-node issue, not a control-plane success signal.
 
-Provider health is reported independently. An unavailable CLI never prevents the other providers or the Codex App from working. Tencent WorkBuddy can use the documented HTTP API when `httpUrl` and its token environment variable are configured; otherwise the adapter probes the `codebuddy` executable. On macOS, it also auto-detects the bundled CLI inside `/Applications/WorkBuddy.app` (or `~/Applications/WorkBuddy.app`) when the app has not added `codebuddy` to `PATH`.
+### Data and follow-up behavior
 
-The Tencent HTTP adapter follows the CodeBuddy beta jobs contract: it submits `POST /api/v1/jobs`, follows the job SSE stream, and uses the documented `X-CodeBuddy-Request: 1` header. Configure it with `WORKBUDDY_HTTP_URL` and, if required by the local gateway, `WORKBUDDY_HTTP_TOKEN`. The installed CLI name is `codebuddy`; if auto-detection is not applicable, set `AGENT_CONTROL_WORKBUDDY_COMMAND` to an explicit executable path. A missing or unhealthy CLI is reported explicitly rather than silently treated as a successful run.
+Tasks, provider events, discussions, and minutes are stored in SQLite. The append-only `events.jsonl` and `minutes/*.md` files provide human-readable local records. A discussion runs up to three sequential critique rounds, with agents in each round receiving only bounded prior-round output. Stopping, provider failure, timeout, or service restart is represented in the record and is not reported as success.
 
-For CLI tasks, the optional MCP `model` field is passed literally to the provider as `--model`; it is a provider-specific model identifier, not a universal alias. Codex CLI defaults to `gpt-5.6-luna` with `model_reasoning_effort="max"`; the task is run through `codex exec --json` with a `workspace-write` sandbox rooted at the requested `cwd`. On this Mac, the observed valid identifiers are WorkBuddy `hy4-preview` (the literal `HY4` is rejected) and Antigravity `gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, or `gemini-3.8-flash-low` (the literal `3.8flash` is rejected). CLI defaults use each provider's structured streaming output so provider messages and session IDs can be persisted; Codex CLI and WorkBuddy follow-ups use their resume options when a session ID is available.
-
-A real read-only check through the installed plugin succeeded for WorkBuddy with `hy4-preview` and, after the network node was corrected, for Antigravity with `gemini-3.8-flash-high`. Both returned `ACC_E2E_OK`; Provider session IDs and event streams were persisted. An earlier Antigravity attempt failed with `FAILED_PRECONDITION (400): User location is not supported for the API use`, which was an environmental network-node issue rather than a control-plane failure.
-
-## Data and permissions
-
-The server never accepts an arbitrary command from an API request. The command and fixed argument template come from configuration; task requests can choose only a registered provider. Raw provider output is recorded with common credential patterns redacted, while the generated minutes retain task and event references for traceability.
-
-When Claude Code is configured with a compatible local `ANTHROPIC_BASE_URL`, the plugin MCP manifest forwards `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_API_KEY` when those variables are available to the Codex host; their values are not stored in the plugin. If the variables are only present in an interactive shell, restart or reload Codex from an environment that can provide them.
-
-Codex CLI uses the same local Codex installation and authentication/configuration available to the MCP host. `CODEX_HOME`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` are allowlisted when present, but their values are not stored in the plugin. The Codex CLI session itself is not treated as the Codex App conversation; the control plane stores its `thread_id` as the provider session reference and keeps the task/event/minutes record separately.
-
-Tasks, provider events, discussions, and minutes are stored in SQLite. The append-only `events.jsonl` and `minutes/*.md` files provide a human-readable local record. A discussion runs up to three sequential critique rounds, with agents in each round receiving only bounded prior-round output. Stopping, provider failure, timeout, or service restart is represented in the record and does not get reported as success.
-
-Every task records `origin` (`codex`, `devspace`, `dashboard`, or `local_cli`), optional `originRequestId`, attempt number, permission policy, capability snapshot, and its last durable event cursor. Remote-origin defaults are least privilege at the control-policy layer: write and network access are not granted by the transport. Only capabilities explicitly declared by an adapter are treated as native enforcement; unknown executor boundaries are reported as `limited` rather than simulated.
-
-Origin capability ceilings are configured per client origin and default to disabled for remote callers. An origin may request write or network access only when its configured ceiling enables that capability, the request explicitly enables it, and the canonical filesystem scope remains within `allowedRoots`. The effective policy also remains bounded by the executor's native capability.
-
-Antigravity headless permission mapping is fail-closed and task-scoped. `agy 1.1.27` exposes no safe per-process native permission override, so the default adapter uses a macOS `sandbox-exec` profile plus a per-task local network proxy. The profile is created under a unique task directory, permits writes only under the effective filesystem scope, permits only the provider transport hosts when tool network is denied, and is removed after provider exit/stop/error. The provider's persistent Antigravity settings are never edited; the containment fallback is the only path that adds `--dangerously-skip-permissions`, and it does so only inside that external boundary.
-
-The fallback deliberately refuses `writeAllowed=true, networkAllowed=false`: agy's headless network tool service can execute outside the child process path, so an OS proxy cannot revoke it after skip-permissions is enabled. A no-capability task (`writeAllowed=false, networkAllowed=false`) stays in agy's native `request-review` mode and real headless denials remain visible. Network-enabled tasks use the external write boundary; writes outside scope remain denied. The profile currently keeps file reads broad because agy 1.1.27 aborts with narrow read subpaths during startup, so this adapter claims hard enforcement for writes, network routing, settings non-mutation, and cleanup—not a narrower read boundary.
-
-Capability reporting is layered and explicit: `native` describes what agy can enforce per process, `mapping` describes the ACC adapter strategy, `externalContainment` describes the macOS profile/proxy, and `effectiveEnforcement` describes the boundary actually claimed for the task. Each Antigravity task also records a finite `executionProfile` preflight with `SUPPORTED`/`UNSUPPORTED` and a stable code. Provider status, exit code, `denied_actions`, structured tool errors, and containment cleanup failures are classified mechanically into `metadata.mechanicalOutcome` and the `task_finished` receipt; no model or language verifier is used for that classification.
-
-Sensitive credential-shaped paths (`.env*`, `*.pem`, `*.key`, `credentials*`, and `auth*`) are denied by default inside the external profile. A task may explicitly opt out with `permissionPolicy.sensitivePathPolicy: {"mode":"allow","override":true}`; the override is task-scoped and is recorded in the policy receipt. Use that override only with a disposable, reviewable task scope.
-
-Follow-up on a completed task reuses the same `taskId`, increments `attemptNo`, preserves the provider session reference when the adapter supports resume, and appends new observable events. This keeps cross-client lookup stable while allowing provider-specific resume limitations to remain visible.
+Follow-up on a completed task reuses the same `taskId`, increments `attemptNo`, preserves the provider session reference when the adapter supports resume, and appends new observable events. This keeps cross-client lookup stable while provider-specific resume limitations remain visible.

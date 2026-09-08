@@ -34,9 +34,10 @@ this limitation is included in capability receipts.
 
 ## Reporting a vulnerability
 
+Private vulnerability reporting is enabled for this repository. Use the
+[private vulnerability report form](https://github.com/bboxeriche/agent-control-center/security/advisories/new).
 Do not include real credentials, private keys, tokens, customer data, or
-production repositories in a report or disposable fixture. Please report a
-security issue privately to the repository owner or maintainer with:
+production repositories in a report or disposable fixture. Include:
 
 - a concise description and impact;
 - the ACC commit, operating system, Node.js version, and provider version;
@@ -44,9 +45,9 @@ security issue privately to the repository owner or maintainer with:
 - relevant task IDs and redacted event/receipt output; and
 - a proposed mitigation, if available.
 
-If no private reporting channel has been provided for the repository, open a
-minimal public issue that contains no exploit details or sensitive data and
-asks the maintainer for a private channel.
+If the private report form is unavailable, open a minimal public issue that
+contains no exploit details or sensitive data and asks the maintainer for a
+private channel.
 
 ## Operational guidance
 
