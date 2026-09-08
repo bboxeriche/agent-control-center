@@ -27,6 +27,32 @@ const APPROVAL_POLICIES = new Set([
   "deny_unapproved",
 ]);
 
+// This is intentionally a small, stable deny list rather than a semantic
+// secret scanner. It protects common credential-shaped files while keeping
+// the policy mechanically auditable and overridable per task.
+export const DEFAULT_SENSITIVE_PATH_PATTERNS = Object.freeze([
+  "(^|/)\\.env(\\..*)?$",
+  ".*\\.(pem|key)$",
+  ".*/(credentials|auth)(\\..*)?$",
+]);
+
+const MECHANICAL_FAILURE_STATUSES = new Set([
+  "error",
+  "failed",
+  "failure",
+  "cancelled",
+  "canceled",
+  "rejected",
+  "denied",
+]);
+
+const MECHANICAL_SUCCESS_STATUSES = new Set([
+  "success",
+  "succeeded",
+  "completed",
+  "done",
+]);
+
 const DEFAULT_AGENT_CAPABILITIES = {
   antigravity: {
     stream: "supported",
@@ -260,6 +286,30 @@ function optionalLabel(value, fieldName, fallback = null) {
   return label;
 }
 
+export function normalizeSensitivePathPolicy(value) {
+  const raw = value === undefined || value === null
+    ? {}
+    : typeof value === "string"
+      ? { mode: value }
+      : value;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("permissionPolicy.sensitivePathPolicy must be an object or mode string");
+  }
+  const mode = String(raw.mode || "deny").trim().toLowerCase();
+  if (!["deny", "allow"].includes(mode)) {
+    throw new Error("permissionPolicy.sensitivePathPolicy.mode must be deny or allow");
+  }
+  if (mode === "allow" && raw.override !== true) {
+    throw new Error("permissionPolicy.sensitivePathPolicy allow mode requires explicit override=true");
+  }
+  return {
+    mode,
+    defaultDenied: mode === "deny",
+    override: mode === "allow",
+    patterns: [...DEFAULT_SENSITIVE_PATH_PATTERNS],
+  };
+}
+
 export function capabilitiesFor(agentId, config = {}) {
   const base = DEFAULT_AGENT_CAPABILITIES[agentId] || {
     stream: "unknown",
@@ -296,6 +346,7 @@ export function buildPermissionPolicy({ cwd, origin, requested = {}, capabilitie
     throw new Error(`permissionPolicy.approvalPolicy must be one of: ${[...APPROVAL_POLICIES].join(", ")}`);
   }
   const filesystemScope = normalizedFilesystemScope(requested.filesystemScope, cwd, allowedRoots);
+  const sensitivePathPolicy = normalizeSensitivePathPolicy(requested.sensitivePathPolicy);
   const worktree = optionalLabel(requested.worktree, "permissionPolicy.worktree");
   if (worktree && (!isAbsolute(worktree) || !isPathWithin(cwd, worktree))) {
     throw new Error("permissionPolicy.worktree must be an absolute path inside cwd");
@@ -322,6 +373,7 @@ export function buildPermissionPolicy({ cwd, origin, requested = {}, capabilitie
     writeAllowed: requestedWriteAllowed && controlPolicy.writeAllowed && capabilities.permissions?.write !== false,
     networkAllowed: requestedNetworkAllowed && controlPolicy.networkAllowed && capabilities.permissions?.network !== false,
     approvalPolicy,
+    sensitivePathPolicy,
   };
   const enforcement = {
     writeAllowed: capabilities.permissions?.write || "unknown",
@@ -348,6 +400,7 @@ export function buildPermissionPolicy({ cwd, origin, requested = {}, capabilitie
       writeAllowed: requestedWriteAllowed,
       networkAllowed: requestedNetworkAllowed,
       approvalPolicy,
+      sensitivePathPolicy,
     },
     controlPolicy,
     effective,
@@ -656,6 +709,130 @@ export function extractSessionId(value) {
     }
   }
   return "";
+}
+
+export function emptyProviderFacts() {
+  return {
+    status: null,
+    statuses: [],
+    deniedActions: [],
+    structuredToolErrors: [],
+  };
+}
+
+function boundedFactText(value, max = 800) {
+  return truncate(redactSecrets(String(value ?? "").trim()), max);
+}
+
+function addUnique(list, value, max = 32) {
+  const normalized = boundedFactText(value);
+  if (!normalized || list.includes(normalized) || list.length >= max) return;
+  list.push(normalized);
+}
+
+function factAction(value) {
+  if (typeof value === "string" || typeof value === "number") return value;
+  if (!value || typeof value !== "object") return "";
+  return value.action || value.name || value.tool || value.tool_name || value.toolName || "";
+}
+
+function factMessage(value) {
+  if (!value || typeof value !== "object") return boundedFactText(value);
+  return boundedFactText(value.message || value.error || value.errorMessage || value.error_message || value.detail || value.result || value.text);
+}
+
+export function collectProviderFacts(value, facts = emptyProviderFacts(), depth = 0) {
+  if (!value || depth > 8) return facts;
+  if (Array.isArray(value)) {
+    for (const item of value) collectProviderFacts(item, facts, depth + 1);
+    return facts;
+  }
+  if (typeof value !== "object") return facts;
+
+  for (const key of ["status", "state", "subtype"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      const status = candidate.trim();
+      facts.status = status;
+      addUnique(facts.statuses, status);
+    }
+  }
+  for (const key of ["denied_actions", "deniedActions", "denied-actions"]) {
+    const denied = value[key];
+    const values = Array.isArray(denied) ? denied : denied === undefined || denied === null ? [] : [denied];
+    for (const item of values) addUnique(facts.deniedActions, factAction(item));
+  }
+
+  const type = boundedFactText(value.type, 200).toLowerCase();
+  const tool = factAction(value);
+  const toolLike = Boolean(tool) || type.includes("tool");
+  const explicitlyErrored = value.is_error === true
+    || value.isError === true
+    || type === "error"
+    || type.endsWith(".error")
+    || type.endsWith("_error")
+    || type.endsWith("-error")
+    || MECHANICAL_FAILURE_STATUSES.has(String(value.status || "").toLowerCase());
+  if (toolLike && explicitlyErrored) {
+    const entry = {
+      tool: boundedFactText(tool, 200) || null,
+      code: boundedFactText(value.code || value.errorCode || value.statusCode, 200) || null,
+      message: factMessage(value) || boundedFactText(type, 200) || "structured provider tool error",
+    };
+    const fingerprint = JSON.stringify(entry);
+    if (!facts.structuredToolErrors.some((item) => JSON.stringify(item) === fingerprint) && facts.structuredToolErrors.length < 32) {
+      facts.structuredToolErrors.push(entry);
+    }
+  }
+
+  for (const nested of Object.values(value)) collectProviderFacts(nested, facts, depth + 1);
+  return facts;
+}
+
+export function classifyMechanicalOutcome({
+  result = {},
+  providerFacts = emptyProviderFacts(),
+  stopRequested = false,
+  timedOut = false,
+  containmentError = null,
+} = {}) {
+  const facts = {
+    ...emptyProviderFacts(),
+    ...(providerFacts || {}),
+    statuses: [...new Set(providerFacts?.statuses || [])],
+    deniedActions: [...new Set(providerFacts?.deniedActions || [])],
+    structuredToolErrors: providerFacts?.structuredToolErrors || [],
+  };
+  const cleanup = result?.permissionCleanup || null;
+  const evidence = {
+    providerStatus: facts.status || null,
+    providerStatuses: facts.statuses,
+    exitCode: result?.exitCode ?? null,
+    signal: result?.signal ?? null,
+    deniedActions: facts.deniedActions,
+    structuredToolErrors: facts.structuredToolErrors,
+    containmentError: containmentError
+      ? { code: containmentError.code || null, message: boundedFactText(containmentError.message || containmentError) }
+      : null,
+    cleanup: cleanup
+      ? { state: cleanup.state || null, reason: cleanup.reason || null, error: cleanup.error || null }
+      : null,
+  };
+  const failedStatus = facts.statuses.find((status) => MECHANICAL_FAILURE_STATUSES.has(String(status).toLowerCase()));
+  if (cleanup?.state === "failed" || containmentError?.code || /containment/i.test(String(result?.error || ""))) {
+    return { outcome: "failed", code: "mechanical_containment_failed", reason: cleanup?.error || containmentError?.message || result?.error || "permission containment failed", evidence };
+  }
+  if (timedOut) return { outcome: "timed_out", code: "mechanical_timeout", reason: "task timed out", evidence };
+  if (stopRequested || result?.stopRequested) return { outcome: "stopped", code: "mechanical_stop", reason: "task stopped", evidence };
+  if (facts.deniedActions.length) return { outcome: "failed", code: "provider_denied_actions", reason: `provider denied actions: ${facts.deniedActions.join(", ")}`, evidence };
+  if (facts.structuredToolErrors.length) return { outcome: "failed", code: "provider_structured_tool_error", reason: "provider reported structured tool errors", evidence };
+  if (failedStatus) return { outcome: "failed", code: "provider_status_failed", reason: `provider reported status ${failedStatus}`, evidence };
+  if (result?.exitCode !== undefined && result?.exitCode !== null && result.exitCode !== 0) {
+    return { outcome: "failed", code: "provider_exit_nonzero", reason: `provider exited with code ${result.exitCode}`, evidence };
+  }
+  if (result?.error) return { outcome: "failed", code: "provider_error", reason: boundedFactText(result.error), evidence };
+  const successStatus = facts.statuses.find((status) => MECHANICAL_SUCCESS_STATUSES.has(String(status).toLowerCase())) || null;
+  return { outcome: "succeeded", code: "mechanical_success", reason: successStatus ? `provider reported status ${successStatus}` : "provider exited cleanly", evidence };
 }
 
 export function parseProviderLine(agent, line) {

@@ -1,8 +1,20 @@
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { prepareAntigravityContainment, ANTIGRAVITY_CONTAINMENT_STRATEGY } from "./antigravity-containment.mjs";
-import { NativePermissionMappingUnavailableError } from "./antigravity-permissions.mjs";
-import { capabilitiesFor, fillTemplateArgs, parseProviderLine, redactSecrets, truncate } from "./core.mjs";
+import {
+  antigravityCapabilityReport,
+  NativePermissionMappingUnavailableError,
+  preflightAntigravityExecutionProfile,
+} from "./antigravity-permissions.mjs";
+import {
+  capabilitiesFor,
+  collectProviderFacts,
+  emptyProviderFacts,
+  fillTemplateArgs,
+  parseProviderLine,
+  redactSecrets,
+  truncate,
+} from "./core.mjs";
 
 function lineDecoder(onLine) {
   let buffer = "";
@@ -182,12 +194,18 @@ export class CliAdapter {
 
   async health() {
     const probe = await probeCommand(this.config.command, this.config.versionArgs || ["--version"]);
+    const capabilityReport = this.agentId === "antigravity"
+      ? antigravityCapabilityReport(this.config.permissionMapping || {})
+      : null;
     return {
       agent: this.agentId,
       label: this.config.label || this.agentId,
       kind: "cli",
       command: this.config.command,
-      permissionMapping: this.config.permissionMapping || { strategy: "unknown" },
+      permissionMapping: capabilityReport
+        ? { ...(this.config.permissionMapping || { strategy: "unknown" }), capabilityReport }
+        : this.config.permissionMapping || { strategy: "unknown" },
+      capabilityReport,
       capabilities: capabilitiesFor(this.agentId, { agents: { [this.agentId]: this.config } }),
       ...probe,
     };
@@ -212,15 +230,15 @@ export class CliAdapter {
 
   async startContained(spec, onEvent) {
     const effective = spec.permissionPolicy?.effective || spec.permissionPolicy || {};
-    // The external proxy can safely permit network=true and the macOS sandbox
-    // can safely deny writes outside scope. It cannot revoke agy's own
-    // headless network tool service after --dangerously-skip-permissions has
-    // approved it. Refuse the unsafe write=true/network=false quadrant rather
-    // than pretending that a prompt-level policy is an OS boundary.
-    if (effective.writeAllowed === true && effective.networkAllowed !== true) {
+    const preflight = preflightAntigravityExecutionProfile(spec.permissionPolicy, {
+      strategy: this.config.permissionMapping?.strategy || ANTIGRAVITY_CONTAINMENT_STRATEGY,
+      sandboxExecutable: this.config.permissionMapping?.sandboxExecutable || "/usr/bin/sandbox-exec",
+    });
+    if (preflight.status !== "SUPPORTED") {
       throw new NativePermissionMappingUnavailableError(
         spec.permissionPolicy,
-        "task-scoped fallback cannot revoke agy's headless network tool while approving writes",
+        preflight.reason,
+        preflight,
       );
     }
     const containment = await prepareAntigravityContainment({
@@ -269,6 +287,7 @@ export class CliAdapter {
     let stdout = "";
     let stderr = "";
     let semanticError = "";
+    const providerFacts = emptyProviderFacts();
     let stopRequested = false;
     let settled = false;
     let finishing = false;
@@ -279,6 +298,7 @@ export class CliAdapter {
     const outputLine = (line, stream) => {
       const parsed = parseProviderLine(this.agentId, line);
       if (parsed.sessionId) providerSessionId = parsed.sessionId;
+      collectProviderFacts(parsed.json, providerFacts);
       const failure = providerSemanticError(parsed.json, parsed.text);
       if (failure && !semanticError) semanticError = failure;
       emitSafely(onEvent, {
@@ -315,6 +335,14 @@ export class CliAdapter {
           cleanupError = error;
         }
       }
+      if (cleanupError) {
+        cleanupResult = {
+          state: "failed",
+          reason: result.stopRequested ? "stopped" : result.error ? "provider_error" : "task_finished",
+          taskId: spec.taskId || null,
+          error: redactSecrets(cleanupError.message),
+        };
+      }
       settled = true;
       const errorText = cleanupError
         ? `permission containment cleanup failed: ${cleanupError.message}`
@@ -323,6 +351,7 @@ export class CliAdapter {
         ...result,
         error: errorText,
         permissionCleanup: cleanupResult,
+        providerFacts,
         sessionId: providerSessionId,
         stdout: redactSecrets(stdout),
         stderr: redactSecrets(stderr),
@@ -495,6 +524,7 @@ export class WorkBuddyHttpAdapter {
   async stream(jobId, controller, onEvent, onSessionId = () => {}) {
     let failed = false;
     let semanticError = "";
+    const providerFacts = emptyProviderFacts();
     let response;
     try {
       response = await fetch(joinUrl(this.baseUrl, `/api/v1/jobs/${encodeURIComponent(jobId)}/stream`), {
@@ -513,6 +543,7 @@ export class WorkBuddyHttpAdapter {
         dataLines = [];
         const parsed = parseProviderLine(this.agentId, line);
         if (parsed.sessionId) onSessionId(parsed.sessionId);
+        collectProviderFacts(parsed.json, providerFacts);
         const failure = providerSemanticError(parsed.json, parsed.text);
         if (failure && !semanticError) semanticError = failure;
         const status = parsed.json?.status || parsed.json?.job?.status || parsed.json?.data?.status;
@@ -544,7 +575,15 @@ export class WorkBuddyHttpAdapter {
         emitSafely(onEvent, { type: "provider_error", stream: "sse", text: error.message, payload: { error: error.message } });
       }
     }
-    return { exitCode: failed ? 1 : 0, signal: null, error: failed ? semanticError || "provider stream failed" : null, sessionId: "", stdout: "", stderr: "" };
+    return {
+      exitCode: failed ? 1 : 0,
+      signal: null,
+      error: failed ? semanticError || "provider stream failed" : null,
+      sessionId: "",
+      stdout: "",
+      stderr: "",
+      providerFacts,
+    };
   }
 }
 

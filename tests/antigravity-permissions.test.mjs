@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import test from "node:test";
-import { existsSync, mkdtempSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { CliAdapter } from "../server/adapters.mjs";
@@ -12,9 +13,12 @@ import {
   prepareAntigravityContainment,
 } from "../server/antigravity-containment.mjs";
 import {
+  ANTIGRAVITY_EXECUTION_PROFILES,
+  antigravityCapabilityReport,
   NATIVE_PERMISSION_MAPPING_UNAVAILABLE,
   NativePermissionMappingUnavailableError,
   createEphemeralPermissionLifecycle,
+  preflightAntigravityExecutionProfile,
   rulesForEffectivePolicy,
 } from "../server/antigravity-permissions.mjs";
 
@@ -37,14 +41,14 @@ test("uses task-scoped external containment when native agy mapping is unavailab
     prepareAntigravityContainment({
       taskId: "task-a",
       cwd: scopeA,
-      permissionPolicy: { effective: { writeAllowed: true, networkAllowed: false, filesystemScope: [scopeA] } },
+      permissionPolicy: { effective: { writeAllowed: true, networkAllowed: true, filesystemScope: [scopeA] } },
       config: { taskRoot, providerHosts: ["daily-cloudcode-pa.googleapis.com"] },
       command: "/bin/sh",
     }),
     prepareAntigravityContainment({
       taskId: "task-b",
       cwd: scopeB,
-      permissionPolicy: { effective: { writeAllowed: false, networkAllowed: true, filesystemScope: [scopeB] } },
+      permissionPolicy: { effective: { writeAllowed: false, networkAllowed: false, filesystemScope: [scopeB] } },
       config: { taskRoot, providerHosts: ["daily-cloudcode-pa.googleapis.com"] },
       command: "/bin/sh",
     }),
@@ -65,7 +69,7 @@ test("uses task-scoped external containment when native agy mapping is unavailab
     assert.equal(networkTargetAllowed("127.0.0.1", { networkAllowed: true, providerHosts: [] }), false);
 
     const denied = await new Promise((resolve, reject) => {
-      const proxy = new URL(first.env.HTTP_PROXY);
+      const proxy = new URL(second.env.HTTP_PROXY);
       const request = httpRequest({ hostname: proxy.hostname, port: proxy.port, path: "http://example.com/", headers: { host: "example.com" } }, (response) => {
         response.resume();
         response.once("end", () => resolve(response.statusCode));
@@ -112,6 +116,89 @@ test("profile has bounded writes and never grants Antigravity settings writes", 
   assert.doesNotMatch(profile, /settings\.json/);
   assert.doesNotMatch(profile, /\.gemini\/config/);
   assert.match(profile, /network-outbound \(remote tcp "localhost:43210"\)/);
+});
+
+test("reports native, mapping, external, and effective Antigravity capability layers", () => {
+  const report = antigravityCapabilityReport({ strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY }, { platform: "darwin", sandboxExecutable: "/usr/bin/sandbox-exec" });
+  assert.equal(report.native.permissionOverride, "unsupported");
+  assert.equal(report.mapping.strategy, ANTIGRAVITY_CONTAINMENT_STRATEGY);
+  assert.equal(report.mapping.persistentSettingsMutation, false);
+  assert.equal(report.externalContainment.enforcement.write, "canonical-scope");
+  assert.equal(report.externalContainment.enforcement.network, "task-proxy");
+  assert.equal(report.externalContainment.enforcement.sensitivePaths, "default-deny");
+  assert.equal(report.effectiveEnforcement.cleanup, "task-scoped");
+  assert.deepEqual(Object.keys(ANTIGRAVITY_EXECUTION_PROFILES), [
+    "read_only",
+    "network_only",
+    "bounded_write_network",
+    "bounded_write_no_network",
+  ]);
+});
+
+test("preflights the finite Antigravity execution profiles with stable codes", () => {
+  const supported = preflightAntigravityExecutionProfile(
+    { effective: { writeAllowed: true, networkAllowed: true } },
+    { strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY, platform: "darwin", sandboxExecutable: "/usr/bin/sandbox-exec" },
+  );
+  assert.equal(supported.status, "SUPPORTED");
+  assert.equal(supported.code, "antigravity_profile_bounded_write_network_supported");
+  const unsupported = preflightAntigravityExecutionProfile(
+    { effective: { writeAllowed: true, networkAllowed: false } },
+    { strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY, platform: "darwin", sandboxExecutable: "/usr/bin/sandbox-exec" },
+  );
+  assert.equal(unsupported.status, "UNSUPPORTED");
+  assert.equal(unsupported.code, "antigravity_profile_write_without_network_unsupported");
+  assert.match(unsupported.reason, /cannot revoke agy's headless network tool/);
+  const readOnly = preflightAntigravityExecutionProfile(
+    { effective: { writeAllowed: false, networkAllowed: false } },
+    { strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY, platform: "darwin", sandboxExecutable: "/usr/bin/sandbox-exec" },
+  );
+  assert.equal(readOnly.status, "SUPPORTED");
+  assert.equal(readOnly.code, "antigravity_profile_read_only_supported");
+  const networkOnly = preflightAntigravityExecutionProfile(
+    { effective: { writeAllowed: false, networkAllowed: true } },
+    { strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY, platform: "darwin", sandboxExecutable: "/usr/bin/sandbox-exec" },
+  );
+  assert.equal(networkOnly.status, "SUPPORTED");
+  assert.equal(networkOnly.code, "antigravity_profile_network_only_supported");
+});
+
+test("enforces the default sensitive-path deny policy on disposable fixtures", () => {
+  if (process.platform !== "darwin") {
+    return;
+  }
+  const root = mkdtempSync(join(tmpdir(), "acc-sensitive-fixture-"));
+  const fixture = join(root, "workspace");
+  mkdirSync(fixture);
+  for (const [name, content] of [["normal.txt", "safe\n"], [".env", "secret\n"], ["private.pem", "secret\n"], ["credentials.json", "secret\n"]]) {
+    writeFileSync(join(fixture, name), content);
+  }
+  const profilePath = join(root, "deny.sb");
+  const overrideProfilePath = join(root, "allow.sb");
+  writeFileSync(profilePath, buildSandboxProfile({
+    filesystemScope: [fixture],
+    writeAllowed: true,
+    networkProxyPort: 43210,
+    taskRoot: root,
+  }));
+  writeFileSync(overrideProfilePath, buildSandboxProfile({
+    filesystemScope: [fixture],
+    writeAllowed: true,
+    networkProxyPort: 43210,
+    taskRoot: root,
+    sensitivePathPolicy: { mode: "allow", override: true },
+  }));
+  try {
+    const read = (profile, name) => spawnSync("/usr/bin/sandbox-exec", ["-f", profile, "/bin/cat", join(fixture, name)], { encoding: "utf8" });
+    assert.equal(read(profilePath, "normal.txt").status, 0);
+    for (const name of [".env", "private.pem", "credentials.json"]) assert.notEqual(read(profilePath, name).status, 0);
+    const sandboxedWrite = spawnSync("/usr/bin/sandbox-exec", ["-f", profilePath, "/bin/sh", "-c", `printf changed > ${JSON.stringify(join(fixture, ".env"))}`], { encoding: "utf8" });
+    assert.notEqual(sandboxedWrite.status, 0);
+    assert.equal(readFileSync(join(fixture, ".env"), "utf8"), "secret\n");
+    assert.equal(read(overrideProfilePath, ".env").status, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("translates a denied write and denied network policy without grants", () => {

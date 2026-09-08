@@ -5,14 +5,20 @@ import { fileURLToPath } from "node:url";
 import { extname, join, resolve } from "node:path";
 import { adapterFor, healthFor } from "./adapters.mjs";
 import {
+  antigravityCapabilityReport,
+  preflightAntigravityExecutionProfile,
+} from "./antigravity-permissions.mjs";
+import {
   DEFAULT_HOST,
   DEFAULT_PORT,
   SERVICE_VERSION,
   buildPermissionPolicy,
   capabilitiesFor,
+  classifyMechanicalOutcome,
   ensureDir,
   ensureAuthToken,
   idempotencyFingerprint,
+  emptyProviderFacts,
   isTerminalStatus,
   loadConfig,
   makeId,
@@ -84,10 +90,11 @@ function discussionAgentNames(config, requested) {
   return unique;
 }
 
-function terminalStatusForResult(result, runtime) {
+function terminalStatusForResult(result, runtime, mechanicalOutcome = null) {
   if (runtime.stopRequested) return "stopped";
   if (runtime.timedOut) return "timed_out";
   if (result?.stopRequested) return "stopped";
+  if (mechanicalOutcome?.outcome === "failed") return "failed";
   if (result?.error || result?.exitCode !== 0) return "failed";
   return "succeeded";
 }
@@ -154,6 +161,17 @@ export class ControlPlane {
       allowedRoots: this.config.allowedRoots,
       originCapabilityCeiling: this.config.originCapabilityCeilings?.[origin] || {},
     });
+    if (input.agent === "antigravity") {
+      const mapping = agentConfig.permissionMapping || {};
+      const capabilityReport = antigravityCapabilityReport(mapping);
+      const executionProfile = preflightAntigravityExecutionProfile(permissionPolicy, {
+        strategy: mapping.strategy,
+        sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+      });
+      permissionPolicy.capabilityReport = capabilityReport;
+      permissionPolicy.executionProfile = executionProfile;
+      permissionPolicy.effectiveEnforcement = capabilityReport.effectiveEnforcement;
+    }
     const requestFingerprint = idempotencyFingerprint({
       agent: input.agent,
       prompt,
@@ -213,6 +231,7 @@ export class ControlPlane {
         originRequestId: task.originRequestId,
         discussionId: task.discussionId,
         roundNo: task.roundNo,
+        executionProfile: task.permissionPolicy.executionProfile || null,
       },
     });
     this.queue.push(task.id);
@@ -263,6 +282,7 @@ export class ControlPlane {
       timedOut: false,
       providerSessionId: task.providerSessionId || "",
       providerJobId: task.providerJobId || "",
+      providerFacts: emptyProviderFacts(),
     };
     this.runtime.set(taskId, runtime);
     this.store.updateTask(taskId, { status: "running", startedAt: nowIso(), errorText: null });
@@ -278,6 +298,7 @@ export class ControlPlane {
         origin: task.origin,
         attemptNo: task.attemptNo,
         permissionStatus: task.permissionPolicy.status || "unknown",
+        executionProfile: task.permissionPolicy.executionProfile || null,
       },
     });
     let result;
@@ -350,7 +371,19 @@ export class ControlPlane {
       clearTimeout(runtime.timeoutTimer);
       if (runtime.providerSessionId === "" && handle.getProviderSessionId) runtime.providerSessionId = handle.getProviderSessionId() || "";
     } catch (error) {
-      result = { exitCode: null, signal: null, error: error.message, stdout: "", stderr: "" };
+      const containmentError = error.code === "native_permission_mapping_unavailable"
+        || String(error.code || "").startsWith("antigravity_")
+        ? { code: error.code || null, message: error.message, preflight: error.preflight || error.details?.preflight || null }
+        : null;
+      result = {
+        exitCode: null,
+        signal: null,
+        error: error.message,
+        stdout: "",
+        stderr: "",
+        providerFacts: emptyProviderFacts(),
+        containmentError,
+      };
       this.emit({
         taskId,
         eventType: "provider_error",
@@ -359,12 +392,28 @@ export class ControlPlane {
           error: error.message,
           code: error.code || null,
           details: error.details || null,
+          executionProfile: task.permissionPolicy.executionProfile || null,
         },
       });
     }
-    const finalStatus = terminalStatusForResult(result, runtime);
-    const errorText = result?.error
-      || (runtime.timedOut ? "task timed out" : finalStatus === "failed" ? truncate(result?.stderr || "provider exited with an error", 4000) : null);
+    const mechanicalOutcome = classifyMechanicalOutcome({
+      result,
+      providerFacts: result?.providerFacts || runtime.providerFacts,
+      stopRequested: runtime.stopRequested,
+      timedOut: runtime.timedOut,
+      containmentError: result?.containmentError || null,
+    });
+    const finalStatus = terminalStatusForResult(result, runtime, mechanicalOutcome);
+    const errorText = runtime.timedOut
+      ? "task timed out"
+      : result?.error
+        || (mechanicalOutcome.outcome === "failed" ? truncate(mechanicalOutcome.reason, 4000) : finalStatus === "failed" ? truncate(result?.stderr || "provider exited with an error", 4000) : null);
+    const metadata = {
+      ...task.metadata,
+      mechanicalOutcome,
+      providerFacts: result?.providerFacts || runtime.providerFacts,
+      permissionCleanup: result?.permissionCleanup || null,
+    };
     const finished = this.store.updateTask(taskId, {
       status: finalStatus,
       finishedAt: nowIso(),
@@ -374,6 +423,7 @@ export class ControlPlane {
       providerJobId: runtime.providerJobId || null,
       resultText: safeResultText(runtime, result),
       errorText,
+      metadata,
     });
     this.emit({
       taskId,
@@ -388,6 +438,9 @@ export class ControlPlane {
         providerJobId: finished.providerJobId,
         error: errorText,
         permissionCleanup: result?.permissionCleanup || null,
+        mechanicalOutcome,
+        providerFacts: result?.providerFacts || runtime.providerFacts,
+        executionProfile: task.permissionPolicy.executionProfile || null,
       },
     });
     return finished;

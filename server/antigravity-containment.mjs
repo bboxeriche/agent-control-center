@@ -13,8 +13,13 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { DEFAULT_SENSITIVE_PATH_PATTERNS } from "./core.mjs";
+import {
+  ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY,
+  preflightAntigravityExecutionProfile,
+} from "./antigravity-permissions.mjs";
 
-export const ANTIGRAVITY_CONTAINMENT_STRATEGY = "sandbox-exec-proxy";
+export const ANTIGRAVITY_CONTAINMENT_STRATEGY = ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY;
 export const ANTIGRAVITY_CONTAINMENT_UNAVAILABLE = "antigravity_containment_unavailable";
 
 // These are the provider transport endpoints observed from agy 1.1.27. They
@@ -54,6 +59,10 @@ function quoteProfileValue(value) {
 
 function profileRule(operation, kind, path) {
   return `(allow ${operation} (${kind} ${quoteProfileValue(path)}))`;
+}
+
+function profileRegexRule(operation, pattern) {
+  return `(deny ${operation} (regex #"${String(pattern).replaceAll("\"", "\\\"")}"))`;
 }
 
 function exactHost(value) {
@@ -133,6 +142,7 @@ export function buildSandboxProfile({
   runtimeRoot = join(homedir(), ".gemini", "antigravity-cli"),
   command,
   taskRoot,
+  sensitivePathPolicy = { mode: "deny", patterns: DEFAULT_SENSITIVE_PATH_PATTERNS },
 } = {}) {
   const scopes = canonicalScope(filesystemScope);
   const runtime = runtimePaths(runtimeRoot);
@@ -158,6 +168,15 @@ export function buildSandboxProfile({
     // IPC exception needed to preserve the user's existing agy login.
     "(allow mach-lookup)",
   ];
+  if (sensitivePathPolicy?.mode !== "allow") {
+    const patterns = Array.isArray(sensitivePathPolicy?.patterns) && sensitivePathPolicy.patterns.length
+      ? sensitivePathPolicy.patterns
+      : DEFAULT_SENSITIVE_PATH_PATTERNS;
+    for (const pattern of patterns) {
+      lines.push(profileRegexRule("file-read*", pattern));
+      lines.push(profileRegexRule("file-write*", pattern));
+    }
+  }
   if (taskRoot) {
     lines.push(profileRule("file-read*", "subpath", resolve(taskRoot)));
     lines.push(profileRule("file-write*", "subpath", resolve(taskRoot)));
@@ -420,6 +439,17 @@ export async function prepareAntigravityContainment({
     throw error;
   }
   const effective = effectivePolicy(permissionPolicy);
+  const preflight = preflightAntigravityExecutionProfile(permissionPolicy, {
+    strategy: config.strategy || ANTIGRAVITY_CONTAINMENT_STRATEGY,
+    platform: process.platform,
+    sandboxExecutable,
+  });
+  if (preflight.status !== "SUPPORTED") {
+    const error = new Error(`${preflight.code}: ${preflight.reason}`);
+    error.code = preflight.code;
+    error.preflight = preflight;
+    throw error;
+  }
   const canonicalCwd = canonicalDirectory(cwd, "task cwd");
   const scopes = canonicalScope(effective.filesystemScope || [canonicalCwd]);
   if (!scopes.every((scope) => isPathInside(canonicalCwd, scope))) {
@@ -446,6 +476,7 @@ export async function prepareAntigravityContainment({
       runtimeRoot: config.runtimeRoot,
       command,
       taskRoot: taskDirectory,
+      sensitivePathPolicy: effective.sensitivePathPolicy,
     });
     const profilePath = join(taskDirectory, "profile.sb");
     writeFileSync(profilePath, profile, { mode: 0o600 });
@@ -497,6 +528,8 @@ export async function prepareAntigravityContainment({
         providerHosts,
         externalNetwork: effective.networkAllowed === true ? "allowlisted-proxy-wildcard" : "provider-hosts-only",
         persistentSettingsMutation: false,
+        sensitivePathPolicy: effective.sensitivePathPolicy || { mode: "deny", patterns: DEFAULT_SENSITIVE_PATH_PATTERNS },
+        executionProfile: preflight,
       },
       cleanup,
       get cleaned() {
