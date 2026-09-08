@@ -139,6 +139,8 @@ export function buildSandboxProfile({
   filesystemScope,
   writeAllowed = false,
   networkProxyPort,
+  networkProxyWildcard = false,
+  allowSystemCaBundle = false,
   runtimeRoot = join(homedir(), ".gemini", "antigravity-cli"),
   command,
   taskRoot,
@@ -160,7 +162,7 @@ export function buildSandboxProfile({
     ...runtime.directories.map((path) => profileRule("file-write*", "subpath", path)),
     ...runtime.literals.map((path) => profileRule("file-write*", "literal", path)),
     profileRule("file-write*", "literal", "/dev/null"),
-    profileRule("network-outbound", "remote tcp", `localhost:${Number(networkProxyPort)}`),
+    profileRule("network-outbound", "remote tcp", networkProxyWildcard ? "localhost:*" : `localhost:${Number(networkProxyPort)}`),
     profileRule("network-inbound", "local tcp", "localhost:*"),
     // The macOS Security framework resolves the login keychain through a
     // bootstrap service name that varies by OS release. Exact names observed
@@ -173,8 +175,17 @@ export function buildSandboxProfile({
       ? sensitivePathPolicy.patterns
       : DEFAULT_SENSITIVE_PATH_PATTERNS;
     for (const pattern of patterns) {
-      lines.push(profileRegexRule("file-read*", pattern));
+      const sandboxPattern = allowSystemCaBundle && String(pattern) === ".*\\.(pem|key)$"
+        ? "(?!/etc/ssl/cert\\.pem$).*\\.(pem|key)$"
+        : pattern;
+      lines.push(profileRegexRule("file-read*", sandboxPattern));
       lines.push(profileRegexRule("file-write*", pattern));
+    }
+    if (allowSystemCaBundle) {
+      // macOS Node/curl builds on this host use the system CA bundle for TLS.
+      // Keep the credential-shaped deny rules while allowing that fixed public
+      // trust store to remain readable inside the provider sandbox.
+      lines.push(profileRule("file-read*", "literal", "/etc/ssl/cert.pem"));
     }
   }
   if (taskRoot) {
@@ -306,7 +317,11 @@ function forwardHttpRequest(request, response, target, upstream, allowed) {
   request.pipe(upstreamRequest);
 }
 
-async function startTaskNetworkProxy({ networkAllowed = false, providerHosts, upstreamEnvironment = process.env } = {}) {
+export async function startTaskNetworkProxy({
+  networkAllowed = false,
+  providerHosts,
+  upstreamEnvironment = process.env,
+} = {}) {
   const allowedProviders = normalizedHostSet(providerHosts);
   const upstream = proxyUrlFromEnvironment(upstreamEnvironment);
   const sockets = new Set();

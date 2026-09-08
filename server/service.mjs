@@ -9,6 +9,12 @@ import {
   preflightAntigravityExecutionProfile,
 } from "./antigravity-permissions.mjs";
 import {
+  preflightWorkBuddyExecutionProfile,
+  workBuddyCapabilityReport,
+  workBuddyModelReport,
+  WORKBUDDY_CONTAINMENT_STRATEGY,
+} from "./workbuddy-permissions.mjs";
+import {
   DEFAULT_HOST,
   DEFAULT_PORT,
   SERVICE_VERSION,
@@ -172,6 +178,40 @@ export class ControlPlane {
       permissionPolicy.executionProfile = executionProfile;
       permissionPolicy.effectiveEnforcement = capabilityReport.effectiveEnforcement;
     }
+    const providerModel = input.agent === "tencent-workbuddy"
+      ? {
+        ...workBuddyModelReport(agentConfig, {
+          requestedModel: input.model === undefined || input.model === null || String(input.model).trim() === ""
+            ? null
+            : model,
+        }),
+        resolvedModel: model,
+      }
+      : null;
+    if (input.agent === "tencent-workbuddy") {
+      const mapping = agentConfig.permissionMapping || {};
+      const capabilityReport = workBuddyCapabilityReport(agentConfig, {
+        http: Boolean(agentConfig.httpUrl?.trim()),
+      });
+      const executionProfile = agentConfig.httpUrl?.trim()
+        ? {
+          profile: null,
+          status: "UNSUPPORTED",
+          code: "workbuddy_http_endpoint_unqualified",
+          mechanism: "http-endpoint-unqualified",
+          reason: "a remote WorkBuddy HTTP endpoint is outside this local process containment boundary",
+        }
+        : preflightWorkBuddyExecutionProfile(permissionPolicy, {
+          strategy: mapping.strategy || WORKBUDDY_CONTAINMENT_STRATEGY,
+          sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+          nativePermissionMode: mapping.nativePermissionMode,
+          providerHosts: mapping.providerHosts,
+          containedTools: mapping.containedTools,
+        });
+      permissionPolicy.capabilityReport = capabilityReport;
+      permissionPolicy.executionProfile = executionProfile;
+      permissionPolicy.effectiveEnforcement = capabilityReport.effectiveEnforcement;
+    }
     const requestFingerprint = idempotencyFingerprint({
       agent: input.agent,
       prompt,
@@ -207,7 +247,10 @@ export class ControlPlane {
         permissionPolicy,
         capabilities,
         providerSessionId: input.sessionId || input.providerSessionId,
-        metadata: input.metadata || {},
+        metadata: {
+          ...(input.metadata || {}),
+          ...(providerModel ? { providerModel } : {}),
+        },
       });
     } catch (error) {
       if (idempotencyKey && /UNIQUE constraint failed: tasks\.idempotency_key/.test(error.message)) {
@@ -373,6 +416,10 @@ export class ControlPlane {
     } catch (error) {
       const containmentError = error.code === "native_permission_mapping_unavailable"
         || String(error.code || "").startsWith("antigravity_")
+        || (task.agent === "tencent-workbuddy" && (
+          error.code === "workbuddy_permission_mapping_unavailable"
+          || String(error.code || "").startsWith("workbuddy_")
+        ))
         ? { code: error.code || null, message: error.message, preflight: error.preflight || error.details?.preflight || null }
         : null;
       result = {
@@ -408,12 +455,22 @@ export class ControlPlane {
       ? "task timed out"
       : result?.error
         || (mechanicalOutcome.outcome === "failed" ? truncate(mechanicalOutcome.reason, 4000) : finalStatus === "failed" ? truncate(result?.stderr || "provider exited with an error", 4000) : null);
+    const providerFacts = result?.providerFacts || runtime.providerFacts;
     const metadata = {
       ...task.metadata,
       mechanicalOutcome,
-      providerFacts: result?.providerFacts || runtime.providerFacts,
+      providerFacts,
       permissionCleanup: result?.permissionCleanup || null,
     };
+    if (task.agent === "tencent-workbuddy") {
+      metadata.providerModel = {
+        ...workBuddyModelReport(this.config.agents[task.agent], {
+          requestedModel: task.metadata?.providerModel?.requestedModel || null,
+          actualModel: providerFacts?.actualModel || null,
+        }),
+        resolvedModel: task.model || null,
+      };
+    }
     const finished = this.store.updateTask(taskId, {
       status: finalStatus,
       finishedAt: nowIso(),
@@ -439,7 +496,7 @@ export class ControlPlane {
         error: errorText,
         permissionCleanup: result?.permissionCleanup || null,
         mechanicalOutcome,
-        providerFacts: result?.providerFacts || runtime.providerFacts,
+        providerFacts,
         executionProfile: task.permissionPolicy.executionProfile || null,
       },
     });

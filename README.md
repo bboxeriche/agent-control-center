@@ -77,6 +77,8 @@ The repository includes `.codex-plugin/plugin.json` and `.mcp.json`. To use the 
 
 Antigravity headless permission mapping is fail-closed and task-scoped. On macOS, ACC uses a `sandbox-exec` profile plus a local network proxy for the supported external-containment profiles. The profile permits writes only under the effective task scope, routes network requests through the task proxy, denies common credential-shaped paths by default, and is removed after provider exit, stop, error, or timeout. Persistent Antigravity settings are not edited.
 
+Tencent WorkBuddy/CodeBuddy CLI tasks use the same task-scoped containment primitives. For the validated WorkBuddy `2.106.4` CLI, ACC pins the default model to `hy4-preview`, passes an explicit per-run `--permission-mode bypassPermissions`, and restricts contained runs to `Read,Write,Edit,Bash,Glob,Grep`. The provider bypass is only a headless approval setting; the ACC boundary remains the canonical filesystem scope, sensitive-path deny rules, task proxy, and cleanup receipt. WorkBuddy's remote `WebFetch` and `WebSearch` tools are disabled in contained runs because they execute outside the local ACC network boundary. Persistent WorkBuddy settings are not edited. Provider-managed `.codebuddy/projects` session files are left under the provider's ownership and are not mistaken for the task cleanup directory.
+
 ## Known limitations
 
 - Antigravity task-scoped external containment is macOS-specific.
@@ -84,12 +86,15 @@ Antigravity headless permission mapping is fail-closed and task-scoped. On macOS
 - The bounded-write/no-network Antigravity capability quadrant is unsupported and fails closed during preflight because the headless network tool can escape the child-process path.
 - Sensitive credential-shaped paths (`.env*`, `*.pem`, `*.key`, `credentials*`, and `auth*`) are denied by default inside the external profile. A task-scoped override is available only for a disposable, reviewable scope.
 - Provider availability, authentication, model identifiers, and network behavior remain provider-specific. ACC does not make a provider cross-platform or guarantee semantic correctness, prompt-injection resistance, or product acceptance.
+- WorkBuddy external containment is macOS-specific. The HTTP jobs adapter is reported as `http-endpoint-unqualified` because a remote endpoint is outside this local process boundary; it is not reported as locally contained.
+- WorkBuddy's supported network profile uses local `Bash` traffic through the task proxy. Remote provider-side network tools are intentionally excluded rather than represented as task-scoped network capability.
+- WorkBuddy normalizes its proxy URL to `127.0.0.1`, so its macOS seatbelt profile needs a loopback wildcard for the proxy connection. A direct `Bash` connection to another local-loopback port can therefore bypass the task proxy; the task proxy still denies local targets and non-allowlisted hosts when traffic uses the proxy. ACC does not claim complete local-service isolation for WorkBuddy on this host.
 
 ## Tested environments
 
 - GitHub Actions runs the check and test suite on `macos-latest` with Node.js 22 and no provider credentials.
 - Local validation targets macOS with Node.js `>=22.5`; the test suite uses fixtures and does not require live provider credentials, private repositories, or an auth token.
-- The current Antigravity containment behavior is validated against the provider version documented in the task receipts; provider versions and model catalogs can change independently.
+- The current Antigravity and WorkBuddy containment behavior is version- and host-specific. WorkBuddy health reports `providerVersion`, `defaultModel`, `validatedModels`, `requestedModel`, and `actualModel` separately; provider versions and model catalogs can change independently.
 
 ## Integration details
 
@@ -117,9 +122,9 @@ The DevSpace surface exposes only the semantic `acc_*` operations needed by a GP
 
 The Tencent HTTP adapter follows the CodeBuddy jobs contract: it submits `POST /api/v1/jobs`, follows the job SSE stream, and uses the documented `X-CodeBuddy-Request: 1` header. Configure it with `WORKBUDDY_HTTP_URL` and, when required by the local gateway, `WORKBUDDY_HTTP_TOKEN`. The installed CLI name is `codebuddy`; if auto-detection is not applicable, set `AGENT_CONTROL_WORKBUDDY_COMMAND` to an explicit executable path.
 
-For CLI tasks, the optional MCP `model` field is passed literally to the provider as `--model`; it is a provider-specific identifier, not a universal alias. Codex CLI defaults to `gpt-5.6-luna` with `model_reasoning_effort="max"`. Antigravity and WorkBuddy model catalogs are provider-specific and should be checked against the installed version.
+For CLI tasks, the optional MCP `model` field is passed literally to the provider as `--model`; it is a provider-specific identifier, not a universal alias. Codex CLI defaults to `gpt-5.6-luna` with `model_reasoning_effort="max"`. WorkBuddy `2.106.4` defaults to the validated `hy4-preview` identifier, while an explicit caller model remains a literal provider-specific override.
 
-Prior local read-only validation succeeded for WorkBuddy with `hy4-preview` and for Antigravity with `gemini-3.8-flash-high`; both returned `ACC_E2E_OK` and persisted provider session IDs and event streams. An earlier Antigravity `FAILED_PRECONDITION (400): User location is not supported for the API use` result was an environmental network-node issue, not a control-plane success signal.
+WorkBuddy adapter receipts mechanically classify structured provider `tool_result` permission denials, including the provider's sandbox-shaped `Error: Write error: EPERM` form, even when the CLI exits zero. This is mechanical evidence only; semantic acceptance remains outside ACC.
 
 ### Data and follow-up behavior
 

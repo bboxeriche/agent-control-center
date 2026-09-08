@@ -2,6 +2,15 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import {
+  WORKBUDDY_CONTAINMENT_STRATEGY,
+  WORKBUDDY_CONTAINED_TOOLS,
+  WORKBUDDY_DEFAULT_MODEL,
+  WORKBUDDY_NATIVE_PERMISSION_MODE,
+  WORKBUDDY_PROVIDER_NETWORK_HOSTS,
+  WORKBUDDY_VALIDATED_MODELS,
+  WORKBUDDY_VERSION,
+} from "./workbuddy-permissions.mjs";
 
 export const SERVICE_VERSION = "0.1.0";
 export const DEFAULT_HOST = "127.0.0.1";
@@ -505,12 +514,28 @@ const DEFAULT_AGENTS = {
     label: "Tencent WorkBuddy / CodeBuddy",
     kind: "http-or-cli",
     command: "codebuddy",
-    args: ["-p", "{prompt}", "--output-format", "stream-json", "--verbose"],
+    args: ["-p", "{prompt}", "--output-format", "stream-json", "--verbose", "--setting-sources", "local", "--sandbox-kill"],
     modelArgs: ["--model", "{model}"],
-    resumeArgs: ["-p", "{prompt}", "--resume", "{sessionId}", "--output-format", "stream-json", "--verbose"],
+    resumeArgs: ["-p", "{prompt}", "--resume", "{sessionId}", "--output-format", "stream-json", "--verbose", "--setting-sources", "local", "--sandbox-kill"],
+    defaultModel: WORKBUDDY_DEFAULT_MODEL,
+    validatedModels: [...WORKBUDDY_VALIDATED_MODELS],
+    providerVersion: WORKBUDDY_VERSION,
+    stdin: "ignore",
+    capabilities: {
+      approval: "per-run-bypass-with-external-containment",
+      permissions: { write: "external-containment", network: "external-containment" },
+    },
     httpUrl: "",
     tokenEnv: "WORKBUDDY_HTTP_TOKEN",
     supportsResume: true,
+    permissionMapping: {
+      strategy: WORKBUDDY_CONTAINMENT_STRATEGY,
+      nativePermissionMode: WORKBUDDY_NATIVE_PERMISSION_MODE,
+      providerHosts: [...WORKBUDDY_PROVIDER_NETWORK_HOSTS],
+      containedTools: [...WORKBUDDY_CONTAINED_TOOLS],
+      reason: "WorkBuddy bypasses headless approval per run; ACC relies on task-scoped external containment for security",
+      persistentSettingsMutation: false,
+    },
   },
 };
 
@@ -717,6 +742,7 @@ export function emptyProviderFacts() {
     statuses: [],
     deniedActions: [],
     structuredToolErrors: [],
+    actualModel: null,
   };
 }
 
@@ -811,6 +837,7 @@ export function classifyMechanicalOutcome({
     signal: result?.signal ?? null,
     deniedActions: facts.deniedActions,
     structuredToolErrors: facts.structuredToolErrors,
+    actualModel: facts.actualModel || null,
     containmentError: containmentError
       ? { code: containmentError.code || null, message: boundedFactText(containmentError.message || containmentError) }
       : null,
@@ -824,6 +851,10 @@ export function classifyMechanicalOutcome({
   }
   if (timedOut) return { outcome: "timed_out", code: "mechanical_timeout", reason: "task timed out", evidence };
   if (stopRequested || result?.stopRequested) return { outcome: "stopped", code: "mechanical_stop", reason: "task stopped", evidence };
+  const permissionError = facts.structuredToolErrors.find((item) => item?.code === "provider_permission_denied");
+  if (permissionError) {
+    return { outcome: "failed", code: "provider_permission_denied", reason: permissionError.message || "provider denied a required permission", evidence };
+  }
   if (facts.deniedActions.length) return { outcome: "failed", code: "provider_denied_actions", reason: `provider denied actions: ${facts.deniedActions.join(", ")}`, evidence };
   if (facts.structuredToolErrors.length) return { outcome: "failed", code: "provider_structured_tool_error", reason: "provider reported structured tool errors", evidence };
   if (failedStatus) return { outcome: "failed", code: "provider_status_failed", reason: `provider reported status ${failedStatus}`, evidence };

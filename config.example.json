@@ -53,9 +53,24 @@
     "tencent-workbuddy": {
       "kind": "http-or-cli",
       "command": "codebuddy",
-      "args": ["-p", "{prompt}", "--output-format", "stream-json", "--verbose"],
+      "args": ["-p", "{prompt}", "--output-format", "stream-json", "--verbose", "--setting-sources", "local", "--sandbox-kill"],
       "modelArgs": ["--model", "{model}"],
-      "resumeArgs": ["-p", "{prompt}", "--resume", "{sessionId}", "--output-format", "stream-json", "--verbose"],
+      "resumeArgs": ["-p", "{prompt}", "--resume", "{sessionId}", "--output-format", "stream-json", "--verbose", "--setting-sources", "local", "--sandbox-kill"],
+      "defaultModel": "hy4-preview",
+      "validatedModels": ["hy4-preview"],
+      "providerVersion": "2.106.4",
+      "stdin": "ignore",
+      "capabilities": {
+        "approval": "per-run-bypass-with-external-containment",
+        "permissions": { "write": "external-containment", "network": "external-containment" }
+      },
+      "permissionMapping": {
+        "strategy": "workbuddy-bypass-with-containment",
+        "nativePermissionMode": "bypassPermissions",
+        "providerHosts": ["copilot.tencent.com", "galileotelemetry.tencent.com"],
+        "containedTools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        "persistentSettingsMutation": false
+      },
       "httpUrl": "",
       "tokenEnv": "WORKBUDDY_HTTP_TOKEN",
       "supportsResume": true

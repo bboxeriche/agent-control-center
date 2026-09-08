@@ -1,11 +1,21 @@
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { prepareAntigravityContainment, ANTIGRAVITY_CONTAINMENT_STRATEGY } from "./antigravity-containment.mjs";
+import { prepareWorkBuddyContainment } from "./workbuddy-containment.mjs";
 import {
   antigravityCapabilityReport,
   NativePermissionMappingUnavailableError,
   preflightAntigravityExecutionProfile,
 } from "./antigravity-permissions.mjs";
+import {
+  preflightWorkBuddyExecutionProfile,
+  WorkBuddyPermissionMappingUnavailableError,
+  workBuddyCapabilityReport,
+  workBuddyModelReport,
+  WORKBUDDY_CONTAINED_TOOLS,
+  WORKBUDDY_CONTAINMENT_STRATEGY,
+  WORKBUDDY_NATIVE_PERMISSION_MODE,
+} from "./workbuddy-permissions.mjs";
 import {
   capabilitiesFor,
   collectProviderFacts,
@@ -55,6 +65,15 @@ function commandArgs(config, spec) {
         ? permissionMapping.writeDenied
         : permissionMapping.writeAllowed;
       if (requestedValue) args[flagIndex + 1] = requestedValue;
+    }
+  }
+  if (permissionMapping?.nativePermissionMode && spec.permissionPolicy && !args.includes("--permission-mode")) {
+    args.push("--permission-mode", permissionMapping.nativePermissionMode || WORKBUDDY_NATIVE_PERMISSION_MODE);
+    if (!args.includes("--tools")) {
+      const containedTools = Array.isArray(permissionMapping.containedTools) && permissionMapping.containedTools.length
+        ? permissionMapping.containedTools
+        : WORKBUDDY_CONTAINED_TOOLS;
+      args.push("--tools", containedTools.join(","));
     }
   }
   if (spec.model && config.modelArgs?.length) {
@@ -134,6 +153,132 @@ function providerSemanticError(value, text = "") {
   return "";
 }
 
+function boundedProviderFact(value, max = 800) {
+  return truncate(redactSecrets(String(value ?? "").trim()), max);
+}
+
+function workBuddyToolName(value) {
+  if (!value || typeof value !== "object") return "";
+  return String(value.name || value.tool_name || value.toolName || value.tool || value.action || "").trim();
+}
+
+function workBuddyToolUseId(value) {
+  if (!value || typeof value !== "object") return "";
+  return String(value.id || value.tool_use_id || value.toolUseId || "").trim();
+}
+
+function workBuddyContentText(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map((item) => workBuddyContentText(item)).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  return [value.text, value.message, value.error, value.detail, value.result, value.content, value.output, value.response]
+    .map((item) => (item && typeof item === "object" ? workBuddyContentText(item) : item))
+    .filter((item) => typeof item === "string" && item.trim())
+    .join("\n");
+}
+
+function addWorkBuddyStructuredError(facts, { tool = "", code = "provider_structured_tool_error", message = "" } = {}) {
+  const entry = {
+    tool: boundedProviderFact(tool, 200) || null,
+    code: boundedProviderFact(code, 200) || null,
+    message: boundedProviderFact(message, 800) || "structured WorkBuddy tool error",
+  };
+  const fingerprint = JSON.stringify(entry);
+  if (!facts.structuredToolErrors.some((item) => JSON.stringify(item) === fingerprint) && facts.structuredToolErrors.length < 32) {
+    facts.structuredToolErrors.push(entry);
+  }
+}
+
+function workBuddyPermissionDenial(value) {
+  const text = workBuddyContentText(value);
+  const match = text.match(/Error:\s*Permission to use ([A-Za-z][A-Za-z0-9_.:-]*) has been denied\b/i);
+  if (match) return { tool: match[1], message: text };
+  if (/Error:\s*.*permission.*denied\b/i.test(text)) return { tool: "", message: text };
+  // WorkBuddy currently serializes an external sandbox denial as a failed
+  // tool_result with is_error=false, for example "Error: Write error: EPERM".
+  // Keep this fallback provider-specific and restricted to the structured
+  // tool_result path; it is not a general natural-language verifier.
+  if (/Error:\s*(?:[A-Za-z][A-Za-z0-9_.:-]*\s+error:\s*)?(?:EPERM|EACCES|operation not permitted)\b/i.test(text)) {
+    return { tool: "", message: text };
+  }
+  return null;
+}
+
+function workBuddyToolResultFailure(value) {
+  const rawResponse = value?._meta?.rawResponse || value?.meta?.rawResponse || value?.rawResponse;
+  if (rawResponse && rawResponse.sandboxDenied === true) {
+    return { code: "provider_permission_denied", message: workBuddyContentText(value) || "WorkBuddy sandbox denied the tool" };
+  }
+  const rawExitCode = rawResponse?.exitCode ?? rawResponse?.exit_code;
+  if (Number.isFinite(Number(rawExitCode)) && Number(rawExitCode) !== 0) {
+    return { code: "provider_tool_exit_nonzero", message: workBuddyContentText(value) || `WorkBuddy tool exited with code ${rawExitCode}` };
+  }
+  const text = workBuddyContentText(value);
+  const exitMatch = text.match(/\b(?:Exit Code|exit_code|exit code)\s*:\s*(-?\d+)\b/i);
+  if (exitMatch && Number(exitMatch[1]) !== 0) {
+    return { code: "provider_tool_exit_nonzero", message: text };
+  }
+  return null;
+}
+
+function collectWorkBuddyProviderFacts(value, facts, toolUses = new Map(), depth = 0) {
+  if (!value || depth > 10) return facts;
+  if (Array.isArray(value)) {
+    for (const item of value) collectWorkBuddyProviderFacts(item, facts, toolUses, depth + 1);
+    return facts;
+  }
+  if (typeof value !== "object") return facts;
+
+  const type = String(value.type || "").toLowerCase();
+  for (const key of ["actual_model", "actualModel", "resolved_model", "resolvedModel"]) {
+    if (typeof value[key] === "string" && value[key].trim()) facts.actualModel = boundedProviderFact(value[key], 200);
+  }
+  if ((["assistant", "result"].includes(type) || value.role === "assistant") && typeof value.model === "string" && value.model.trim()) {
+    facts.actualModel = boundedProviderFact(value.model, 200);
+  }
+  if (type === "tool_use") {
+    const id = workBuddyToolUseId(value);
+    const name = workBuddyToolName(value);
+    if (id && name) toolUses.set(id, name);
+  }
+  if (type === "tool_result") {
+    const tool = toolUses.get(workBuddyToolUseId(value)) || workBuddyToolName(value) || "unknown";
+    const denial = workBuddyPermissionDenial(value);
+    const toolFailure = workBuddyToolResultFailure(value);
+    if (denial || toolFailure || value.is_error === true || value.isError === true) {
+      addWorkBuddyStructuredError(facts, {
+        tool: denial?.tool || tool,
+        code: denial?.message ? "provider_permission_denied" : toolFailure?.code || "provider_structured_tool_error",
+        message: denial?.message || toolFailure?.message || workBuddyContentText(value),
+      });
+    }
+  }
+
+  for (const key of ["permission_denials", "permissionDenials", "permission-denials"]) {
+    const denials = value[key];
+    if (!denials) continue;
+    const values = Array.isArray(denials) ? denials : [denials];
+    for (const item of values) {
+      const action = typeof item === "string" ? item : workBuddyToolName(item) || item?.action || item?.name || "unknown";
+      const message = workBuddyContentText(item) || `WorkBuddy denied ${action}`;
+      addWorkBuddyStructuredError(facts, { tool: action, code: "provider_permission_denied", message });
+    }
+  }
+
+  for (const key of ["errors", "error_details", "errorDetails"]) {
+    const errors = value[key];
+    if (!errors) continue;
+    const values = Array.isArray(errors) ? errors : [errors];
+    for (const item of values) {
+      const message = workBuddyContentText(item) || boundedProviderFact(item, 800);
+      if (message) addWorkBuddyStructuredError(facts, { tool: workBuddyToolName(item), message });
+    }
+  }
+
+  for (const nested of Object.values(value)) collectWorkBuddyProviderFacts(nested, facts, toolUses, depth + 1);
+  return facts;
+}
+
 async function probeCommand(command, versionArgs = ["--version"]) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
@@ -196,7 +341,12 @@ export class CliAdapter {
     const probe = await probeCommand(this.config.command, this.config.versionArgs || ["--version"]);
     const capabilityReport = this.agentId === "antigravity"
       ? antigravityCapabilityReport(this.config.permissionMapping || {})
-      : null;
+      : this.agentId === "tencent-workbuddy"
+        ? workBuddyCapabilityReport(this.config)
+        : null;
+    const modelReport = this.agentId === "tencent-workbuddy"
+      ? workBuddyModelReport(this.config)
+      : {};
     return {
       agent: this.agentId,
       label: this.config.label || this.agentId,
@@ -207,6 +357,7 @@ export class CliAdapter {
         : this.config.permissionMapping || { strategy: "unknown" },
       capabilityReport,
       capabilities: capabilitiesFor(this.agentId, { agents: { [this.agentId]: this.config } }),
+      ...modelReport,
       ...probe,
     };
   }
@@ -219,6 +370,24 @@ export class CliAdapter {
       // agy 1.1.27 has no per-process native permission override. Do not let a
       // persistent provider grant drift away from ACC's task policy.
       throw new NativePermissionMappingUnavailableError(spec.permissionPolicy);
+    }
+    if (this.agentId === "tencent-workbuddy" && this.config.permissionMapping?.strategy === WORKBUDDY_CONTAINMENT_STRATEGY) {
+      return this.startWorkBuddyContained(spec, onEvent);
+    }
+    if (this.agentId === "tencent-workbuddy" && spec.permissionPolicy && this.config.permissionMapping?.strategy !== "test-double") {
+      const mapping = this.config.permissionMapping || {};
+      const preflight = preflightWorkBuddyExecutionProfile(spec.permissionPolicy, {
+        strategy: mapping.strategy || "unknown",
+        sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+        nativePermissionMode: mapping.nativePermissionMode || WORKBUDDY_NATIVE_PERMISSION_MODE,
+        providerHosts: mapping.providerHosts,
+        containedTools: mapping.containedTools,
+      });
+      throw new WorkBuddyPermissionMappingUnavailableError(
+        spec.permissionPolicy,
+        preflight.reason || "approved WorkBuddy containment mapping is unavailable",
+        preflight,
+      );
     }
 
     return this.startProcess(spec, onEvent, {
@@ -268,6 +437,44 @@ export class CliAdapter {
     }
   }
 
+  async startWorkBuddyContained(spec, onEvent) {
+    const mapping = this.config.permissionMapping || {};
+    const preflight = preflightWorkBuddyExecutionProfile(spec.permissionPolicy, {
+      strategy: mapping.strategy || WORKBUDDY_CONTAINMENT_STRATEGY,
+      sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+      nativePermissionMode: mapping.nativePermissionMode || WORKBUDDY_NATIVE_PERMISSION_MODE,
+      providerHosts: mapping.providerHosts,
+      containedTools: mapping.containedTools,
+    });
+    if (preflight.status !== "SUPPORTED") {
+      throw new WorkBuddyPermissionMappingUnavailableError(
+        spec.permissionPolicy,
+        preflight.reason,
+        preflight,
+      );
+    }
+    let containment;
+    try {
+      containment = await prepareWorkBuddyContainment({
+        taskId: spec.taskId,
+        cwd: spec.cwd,
+        permissionPolicy: spec.permissionPolicy,
+        config: mapping,
+        command: this.config.command,
+      });
+      return this.startProcess(spec, onEvent, {
+        command: containment.sandboxExecutable,
+        args: containment.argsFor(commandArgs(this.config, spec)),
+        env: { ...this.config.env, ...containment.env },
+        cleanup: containment.cleanup,
+        permissionReceipt: containment.permissionReceipt,
+      });
+    } catch (error) {
+      await containment?.cleanup("spawn_error").catch(() => {});
+      throw error;
+    }
+  }
+
   startProcess(spec, onEvent, {
     command,
     args,
@@ -291,6 +498,7 @@ export class CliAdapter {
     let stopRequested = false;
     let settled = false;
     let finishing = false;
+    const workBuddyToolUses = this.agentId === "tencent-workbuddy" ? new Map() : null;
     let resolveWait;
     const wait = new Promise((resolve) => {
       resolveWait = resolve;
@@ -299,6 +507,9 @@ export class CliAdapter {
       const parsed = parseProviderLine(this.agentId, line);
       if (parsed.sessionId) providerSessionId = parsed.sessionId;
       collectProviderFacts(parsed.json, providerFacts);
+      if (this.agentId === "tencent-workbuddy") {
+        collectWorkBuddyProviderFacts(parsed.json, providerFacts, workBuddyToolUses);
+      }
       const failure = providerSemanticError(parsed.json, parsed.text);
       if (failure && !semanticError) semanticError = failure;
       emitSafely(onEvent, {
@@ -442,6 +653,8 @@ export class WorkBuddyHttpAdapter {
   }
 
   async health() {
+    const capabilityReport = workBuddyCapabilityReport(this.config, { http: true });
+    const modelReport = workBuddyModelReport(this.config);
     try {
       const response = await fetchWithTimeout(joinUrl(this.baseUrl, "/api/v1/health"), { method: "GET", headers: workBuddyHeaders(this.config) }, 3000);
       return {
@@ -449,6 +662,13 @@ export class WorkBuddyHttpAdapter {
         label: this.config.label || this.agentId,
         kind: "http",
         endpoint: this.baseUrl,
+        permissionMapping: {
+          ...(this.config.permissionMapping || { strategy: "http-endpoint-unqualified" }),
+          strategy: "http-endpoint-unqualified",
+          capabilityReport,
+        },
+        capabilityReport,
+        ...modelReport,
         capabilities: capabilitiesFor(this.agentId, { agents: { [this.agentId]: this.config } }),
         configured: true,
         available: response.ok,
@@ -462,6 +682,13 @@ export class WorkBuddyHttpAdapter {
         label: this.config.label || this.agentId,
         kind: "http",
         endpoint: this.baseUrl,
+        permissionMapping: {
+          ...(this.config.permissionMapping || { strategy: "http-endpoint-unqualified" }),
+          strategy: "http-endpoint-unqualified",
+          capabilityReport,
+        },
+        capabilityReport,
+        ...modelReport,
         configured: true,
         available: false,
         error: error.name === "AbortError" ? "health probe timed out" : error.message,
@@ -525,6 +752,7 @@ export class WorkBuddyHttpAdapter {
     let failed = false;
     let semanticError = "";
     const providerFacts = emptyProviderFacts();
+    const workBuddyToolUses = new Map();
     let response;
     try {
       response = await fetch(joinUrl(this.baseUrl, `/api/v1/jobs/${encodeURIComponent(jobId)}/stream`), {
@@ -544,6 +772,7 @@ export class WorkBuddyHttpAdapter {
         const parsed = parseProviderLine(this.agentId, line);
         if (parsed.sessionId) onSessionId(parsed.sessionId);
         collectProviderFacts(parsed.json, providerFacts);
+        collectWorkBuddyProviderFacts(parsed.json, providerFacts, workBuddyToolUses);
         const failure = providerSemanticError(parsed.json, parsed.text);
         if (failure && !semanticError) semanticError = failure;
         const status = parsed.json?.status || parsed.json?.job?.status || parsed.json?.data?.status;

@@ -32,6 +32,33 @@ are removed after completion, stop, error, or timeout. File reads remain broad
 because the provider aborts during startup when narrow read subpaths are used;
 this limitation is included in capability receipts.
 
+## Tencent WorkBuddy boundary
+
+WorkBuddy/CodeBuddy `2.106.4` is invoked with the per-run
+`--permission-mode bypassPermissions` option only inside the ACC task-scoped
+external containment path. The provider option bypasses headless approval UX;
+it is not treated as a security boundary and ACC does not modify WorkBuddy
+global settings or persistent project permissions. Contained CLI runs restrict
+the provider tool surface to `Read`, `Write`, `Edit`, `Bash`, `Glob`, and `Grep`.
+Remote `WebFetch` and `WebSearch` are excluded because their execution is not
+inside the local ACC network boundary. Network-enabled probes therefore use
+local `Bash` traffic through the task proxy. The provider transport hosts are
+allowlisted separately so the model session can remain alive while task
+network access is denied. WorkBuddy normalizes the proxy URL to `127.0.0.1`,
+so its seatbelt profile uses a loopback wildcard for the proxy connection; the
+task proxy still rejects local targets and non-allowlisted hosts when traffic
+uses the proxy, but the compatibility wildcard also permits a direct provider
+`Bash` connection to another local-loopback port. This is a provider-specific
+local-service isolation limitation compared with Antigravity's exact-port rule;
+ACC does not claim complete local-loopback isolation for WorkBuddy.
+
+The default WorkBuddy model is the explicit `hy4-preview` identifier. Health
+and task receipts distinguish the default, validated, requested, resolved, and
+provider-reported actual model values. WorkBuddy HTTP jobs are reported as
+`http-endpoint-unqualified`; a remote HTTP endpoint is not represented as
+locally contained. WorkBuddy provider-managed runtime files are not deleted by
+ACC cleanup; only the ACC-owned task directory and proxy are cleaned.
+
 ## Reporting a vulnerability
 
 Private vulnerability reporting is enabled for this repository. Use the
@@ -59,3 +86,6 @@ private channel.
 - Use only disposable fixtures for sensitive-path and containment tests.
 - Do not use `--dangerously-skip-permissions` outside ACC's verified external
   containment path.
+- Treat any WorkBuddy profile that reports `UNSUPPORTED`, any HTTP endpoint
+  path, and any attempt to re-enable `WebFetch`/`WebSearch` in contained runs
+  as fail-closed conditions requiring review.
