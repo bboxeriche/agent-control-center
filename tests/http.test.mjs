@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { defaultConfig } from "../server/core.mjs";
-import { startControlServer } from "../server/service.mjs";
+import { ControlPlane, startControlServer } from "../server/service.mjs";
+import { ANTIGRAVITY_CONTAINMENT_STRATEGY } from "../server/antigravity-containment.mjs";
 
 const fixture = join(process.cwd(), "tests", "fixtures", "fake-agent.mjs");
 
@@ -15,6 +16,7 @@ function fakeConfig() {
   for (const agent of Object.keys(config.agents)) {
     config.agents[agent] = { ...config.agents[agent], command: process.execPath, args: [fixture, "-p", "{prompt}"], env: { ...process.env } };
   }
+  config.agents.antigravity.permissionMapping = { strategy: "test-double" };
   return config;
 }
 
@@ -56,5 +58,48 @@ test("serves health, task creation, task status, and dashboard", async () => {
     assert.equal(cookieAuthorized.status, 200);
   } finally {
     await running.close();
+  }
+});
+
+test("waits for contained provider cleanup before finalizing a timed-out task", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("sandbox-exec fallback is macOS-specific");
+    return;
+  }
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-timeout-cleanup-data-"));
+  const taskRoot = await mkdtemp(join(tmpdir(), "acc-timeout-cleanup-root-"));
+  const config = defaultConfig();
+  config.allowedRoots = [process.cwd()];
+  config.defaultTimeoutMs = 1000;
+  config.agents.antigravity = {
+    ...config.agents.antigravity,
+    command: process.execPath,
+    args: [fixture, "-p", "{prompt}"],
+    env: { ...process.env, FAKE_AGENT_DELAY_MS: "10000" },
+    permissionMapping: {
+      strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY,
+      taskRoot,
+      providerHosts: [],
+    },
+  };
+  const plane = new ControlPlane({ dataDir, config });
+  try {
+    const task = plane.createTask({
+      agent: "antigravity",
+      prompt: "hold until the control-plane timeout",
+      cwd: process.cwd(),
+      origin: "devspace",
+    });
+    const finished = await plane.waitForTask(task.id, 10000);
+    assert.equal(finished.status, "timed_out");
+    const completion = plane.listTaskEvents(task.id, 0).find((event) => event.eventType === "task_finished");
+    assert.equal(completion?.payload?.permissionCleanup?.state, "cleaned");
+    assert.deepEqual(await readdir(taskRoot), []);
+  } finally {
+    await plane.shutdown();
+    await Promise.all([
+      rm(dataDir, { recursive: true, force: true }),
+      rm(taskRoot, { recursive: true, force: true }),
+    ]);
   }
 });

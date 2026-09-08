@@ -222,16 +222,26 @@ function hasTraversalSegment(value) {
   return String(value).split(/[\\/]+/).includes("..");
 }
 
-function normalizedFilesystemScope(value, cwd) {
+function normalizedFilesystemScope(value, cwd, allowedRoots = []) {
   if (value === undefined || value === null || value === "cwd") return [cwd];
   const raw = Array.isArray(value) ? value : [value];
   if (!raw.length) return [cwd];
+  const canonicalRoots = allowedRoots.map((root) => realpathSync(root));
   const scope = [...new Set(raw.map((item) => {
     const path = String(item || "").trim();
     if (!isAbsolute(path)) throw new Error("permissionPolicy.filesystemScope paths must be absolute");
-    const resolved = resolve(path);
-    if (!isPathWithin(cwd, resolved)) throw new Error("permissionPolicy.filesystemScope cannot extend outside cwd");
-    return resolved;
+    if (hasTraversalSegment(path)) throw new Error("permissionPolicy.filesystemScope cannot contain parent traversal segments");
+    let canonical;
+    try {
+      canonical = realpathSync(resolve(path));
+    } catch (error) {
+      throw new Error(`permissionPolicy.filesystemScope path is not accessible: ${path} (${error.message})`);
+    }
+    if (!isPathWithin(cwd, canonical)) throw new Error("permissionPolicy.filesystemScope cannot extend outside cwd");
+    if (canonicalRoots.length && !canonicalRoots.some((root) => isPathWithin(root, canonical))) {
+      throw new Error("permissionPolicy.filesystemScope is outside the configured allowed workspace roots");
+    }
+    return canonical;
   }))];
   return scope.length ? scope : [cwd];
 }
@@ -276,7 +286,7 @@ export function capabilitiesFor(agentId, config = {}) {
   return capabilities;
 }
 
-export function buildPermissionPolicy({ cwd, origin, requested = {}, capabilities = {} }) {
+export function buildPermissionPolicy({ cwd, origin, requested = {}, capabilities = {}, allowedRoots = [], originCapabilityCeiling = {} }) {
   const remoteOrigin = origin === "devspace" || origin === "dashboard";
   const defaultWriteAllowed = !remoteOrigin;
   const requestedWriteAllowed = optionalBoolean(requested.writeAllowed, "permissionPolicy.writeAllowed", defaultWriteAllowed);
@@ -285,16 +295,22 @@ export function buildPermissionPolicy({ cwd, origin, requested = {}, capabilitie
   if (!APPROVAL_POLICIES.has(approvalPolicy)) {
     throw new Error(`permissionPolicy.approvalPolicy must be one of: ${[...APPROVAL_POLICIES].join(", ")}`);
   }
-  const filesystemScope = normalizedFilesystemScope(requested.filesystemScope, cwd);
+  const filesystemScope = normalizedFilesystemScope(requested.filesystemScope, cwd, allowedRoots);
   const worktree = optionalLabel(requested.worktree, "permissionPolicy.worktree");
   if (worktree && (!isAbsolute(worktree) || !isPathWithin(cwd, worktree))) {
     throw new Error("permissionPolicy.worktree must be an absolute path inside cwd");
   }
   const project = optionalLabel(requested.project, "permissionPolicy.project", cwd);
   const repo = optionalLabel(requested.repo, "permissionPolicy.repo");
+  const ceilingWriteAllowed = remoteOrigin
+    ? optionalBoolean(originCapabilityCeiling.writeAllowed, "originCapabilityCeiling.writeAllowed", false)
+    : true;
+  const ceilingNetworkAllowed = remoteOrigin
+    ? optionalBoolean(originCapabilityCeiling.networkAllowed, "originCapabilityCeiling.networkAllowed", false)
+    : false;
   const controlPolicy = {
-    writeAllowed: !remoteOrigin,
-    networkAllowed: false,
+    writeAllowed: ceilingWriteAllowed,
+    networkAllowed: ceilingNetworkAllowed,
     filesystemScope: [cwd],
   };
   const effective = {
@@ -303,8 +319,8 @@ export function buildPermissionPolicy({ cwd, origin, requested = {}, capabilitie
     workspace: cwd,
     worktree,
     filesystemScope,
-    writeAllowed: requestedWriteAllowed && controlPolicy.writeAllowed,
-    networkAllowed: requestedNetworkAllowed && controlPolicy.networkAllowed,
+    writeAllowed: requestedWriteAllowed && controlPolicy.writeAllowed && capabilities.permissions?.write !== false,
+    networkAllowed: requestedNetworkAllowed && controlPolicy.networkAllowed && capabilities.permissions?.network !== false,
     approvalPolicy,
   };
   const enforcement = {
@@ -366,6 +382,18 @@ const DEFAULT_AGENTS = {
     args: ["-p", "{prompt}", "--output-format", "stream-json"],
     modelArgs: ["--model", "{model}"],
     supportsResume: false,
+    permissionMapping: {
+      strategy: "sandbox-exec-proxy",
+      reason: "agy 1.1.27 exposes no safe per-process permission override; use task-scoped external containment",
+      providerHosts: [
+        "accounts.google.com",
+        "daily-cloudcode-pa.googleapis.com",
+        "generativelanguage.googleapis.com",
+        "lh3.googleusercontent.com",
+        "oauth2.googleapis.com",
+        "www.googleapis.com",
+      ],
+    },
   },
   "claude-code": {
     label: "Claude Code",
@@ -447,12 +475,22 @@ export function defaultConfig() {
     maxWaitMs: 60 * 1000,
     maxPromptChars: 20000,
     maxDiscussionRounds: 3,
+    originCapabilityCeilings: {
+      codex: { writeAllowed: true, networkAllowed: false },
+      devspace: { writeAllowed: false, networkAllowed: false },
+      dashboard: { writeAllowed: false, networkAllowed: false },
+      local_cli: { writeAllowed: true, networkAllowed: false },
+    },
     agents,
   };
 }
 
 function mergeConfig(base, override) {
   const result = { ...base, ...override };
+  result.originCapabilityCeilings = {
+    ...(base.originCapabilityCeilings || {}),
+    ...(override?.originCapabilityCeilings || {}),
+  };
   result.agents = { ...base.agents };
   for (const [id, agent] of Object.entries(override?.agents ?? {})) {
     result.agents[id] = { ...(base.agents[id] ?? {}), ...agent };

@@ -7,13 +7,29 @@
   "defaultTimeoutMs": 1800000,
   "maxWaitMs": 60000,
   "maxPromptChars": 20000,
+  "originCapabilityCeilings": {
+    "devspace": { "writeAllowed": false, "networkAllowed": false },
+    "dashboard": { "writeAllowed": false, "networkAllowed": false }
+  },
   "agents": {
     "antigravity": {
       "kind": "cli",
       "command": "agy",
       "args": ["-p", "{prompt}", "--output-format", "stream-json"],
       "modelArgs": ["--model", "{model}"],
-      "supportsResume": false
+      "supportsResume": false,
+      "permissionMapping": {
+        "strategy": "sandbox-exec-proxy",
+        "reason": "agy 1.1.27 exposes no safe per-process permission override; use task-scoped external containment",
+        "providerHosts": [
+          "accounts.google.com",
+          "daily-cloudcode-pa.googleapis.com",
+          "generativelanguage.googleapis.com",
+          "lh3.googleusercontent.com",
+          "oauth2.googleapis.com",
+          "www.googleapis.com"
+        ]
+      }
     },
     "claude-code": {
       "kind": "cli",

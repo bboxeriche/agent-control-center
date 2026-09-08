@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -24,6 +24,7 @@ function fakeConfig() {
       env: { ...process.env, FAKE_AGENT_SESSION: `session-${agent}`, FAKE_AGENT_DELAY_MS: "100" },
     };
   }
+  config.agents.antigravity.permissionMapping = { strategy: "test-double" };
   return config;
 }
 
@@ -214,6 +215,118 @@ test("enforces canonical allowed roots for remote workspaces and paginates discu
     assert.equal(typeof page.nextCursor, "number");
     assert.equal(typeof page.hasMore, "boolean");
     assert.ok(page.eventCursor >= page.nextCursor);
+  } finally {
+    await plane.shutdown();
+  }
+});
+
+test("applies origin capability ceilings without widening defaults or executor limits", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-capability-ceiling-"));
+  const config = fakeConfig();
+  config.originCapabilityCeilings.devspace = { writeAllowed: true, networkAllowed: true };
+  config.allowedRoots = [process.cwd()];
+  const plane = new ControlPlane({ dataDir, config });
+  try {
+    const defaultRequest = plane.createTask({
+      agent: "codex-cli",
+      prompt: "default stays least privilege",
+      cwd: process.cwd(),
+      origin: "devspace",
+    });
+    assert.equal(defaultRequest.permissionPolicy.requested.writeAllowed, false);
+    assert.equal(defaultRequest.permissionPolicy.requested.networkAllowed, false);
+    assert.equal(defaultRequest.permissionPolicy.controlPolicy.writeAllowed, true);
+    assert.equal(defaultRequest.permissionPolicy.controlPolicy.networkAllowed, true);
+    assert.equal(defaultRequest.permissionPolicy.effective.writeAllowed, false);
+    assert.equal(defaultRequest.permissionPolicy.effective.networkAllowed, false);
+
+    const bounded = plane.createTask({
+      agent: "codex-cli",
+      prompt: "explicit bounded capabilities",
+      cwd: process.cwd(),
+      origin: "devspace",
+      permissionPolicy: {
+        writeAllowed: true,
+        networkAllowed: true,
+        filesystemScope: [process.cwd()],
+      },
+    });
+    assert.equal(bounded.permissionPolicy.controlPolicy.writeAllowed, true);
+    assert.equal(bounded.permissionPolicy.controlPolicy.networkAllowed, true);
+    assert.equal(bounded.permissionPolicy.effective.writeAllowed, true);
+    assert.equal(bounded.permissionPolicy.effective.networkAllowed, true);
+    assert.deepEqual(bounded.permissionPolicy.effective.filesystemScope, [process.cwd()]);
+
+    const writeOnly = plane.createTask({
+      agent: "codex-cli",
+      prompt: "explicit write only",
+      cwd: process.cwd(),
+      origin: "devspace",
+      permissionPolicy: { writeAllowed: true, networkAllowed: false, filesystemScope: [process.cwd()] },
+    });
+    assert.equal(writeOnly.permissionPolicy.effective.writeAllowed, true);
+    assert.equal(writeOnly.permissionPolicy.effective.networkAllowed, false);
+
+    const noUpgrade = plane.createTask({
+      agent: "codex-cli",
+      prompt: "request remains denied",
+      cwd: process.cwd(),
+      origin: "devspace",
+      permissionPolicy: { writeAllowed: false, networkAllowed: false, filesystemScope: [process.cwd()] },
+    });
+    assert.equal(noUpgrade.permissionPolicy.effective.writeAllowed, false);
+    assert.equal(noUpgrade.permissionPolicy.effective.networkAllowed, false);
+
+    assert.throws(() => plane.createTask({
+      agent: "codex-cli",
+      prompt: "scope escape",
+      cwd: process.cwd(),
+      origin: "devspace",
+      permissionPolicy: { writeAllowed: true, filesystemScope: [tmpdir()] },
+    }), /filesystemScope cannot extend outside cwd/);
+
+    config.originCapabilityCeilings.devspace = { writeAllowed: false, networkAllowed: false };
+    const deniedPlane = new ControlPlane({ dataDir: await mkdtemp(join(tmpdir(), "acc-capability-denied-")), config });
+    try {
+      const denied = deniedPlane.createTask({
+        agent: "codex-cli",
+        prompt: "origin ceiling denies request",
+        cwd: process.cwd(),
+        origin: "devspace",
+        permissionPolicy: { writeAllowed: true, networkAllowed: true, filesystemScope: [process.cwd()] },
+      });
+      assert.equal(denied.permissionPolicy.controlPolicy.writeAllowed, false);
+      assert.equal(denied.permissionPolicy.controlPolicy.networkAllowed, false);
+      assert.equal(denied.permissionPolicy.effective.writeAllowed, false);
+      assert.equal(denied.permissionPolicy.effective.networkAllowed, false);
+      await deniedPlane.shutdown();
+    } catch (error) {
+      await deniedPlane.shutdown();
+      throw error;
+    }
+  } finally {
+    await plane.shutdown();
+  }
+});
+
+test("rejects a filesystem scope that escapes through a symlink", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-symlink-data-"));
+  const root = await mkdtemp(join(tmpdir(), "acc-symlink-root-"));
+  const outside = await mkdtemp(join(tmpdir(), "acc-symlink-outside-"));
+  const link = join(root, "linked-outside");
+  await symlink(outside, link, "dir");
+  const config = fakeConfig();
+  config.allowedRoots = [root];
+  config.originCapabilityCeilings.devspace = { writeAllowed: true, networkAllowed: true };
+  const plane = new ControlPlane({ dataDir, config });
+  try {
+    assert.throws(() => plane.createTask({
+      agent: "codex-cli",
+      prompt: "symlink escape",
+      cwd: root,
+      origin: "devspace",
+      permissionPolicy: { writeAllowed: true, filesystemScope: [link] },
+    }), /filesystemScope cannot extend outside cwd/);
   } finally {
     await plane.shutdown();
   }

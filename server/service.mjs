@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { extname, join, resolve } from "node:path";
 import { adapterFor, healthFor } from "./adapters.mjs";
@@ -84,8 +85,9 @@ function discussionAgentNames(config, requested) {
 }
 
 function terminalStatusForResult(result, runtime) {
-  if (runtime.stopRequested || result?.stopRequested) return "stopped";
+  if (runtime.stopRequested) return "stopped";
   if (runtime.timedOut) return "timed_out";
+  if (result?.stopRequested) return "stopped";
   if (result?.error || result?.exitCode !== 0) return "failed";
   return "succeeded";
 }
@@ -149,6 +151,8 @@ export class ControlPlane {
       origin,
       requested: requestedPermissions,
       capabilities,
+      allowedRoots: this.config.allowedRoots,
+      originCapabilityCeiling: this.config.originCapabilityCeilings?.[origin] || {},
     });
     const requestFingerprint = idempotencyFingerprint({
       agent: input.agent,
@@ -280,6 +284,7 @@ export class ControlPlane {
     try {
       const adapter = adapterFor(task.agent, this.config);
       const handle = await adapter.start({
+        taskId,
         prompt: task.prompt,
         cwd: task.cwd,
         model: task.model,
@@ -318,14 +323,27 @@ export class ControlPlane {
           providerJobId: runtime.providerJobId || null,
           command: this.config.agents[task.agent].command || null,
           argCount: handle.args?.length || 0,
+          permission: handle.permissionReceipt || null,
         },
       });
       const timeoutPromise = new Promise((resolve) => {
         runtime.timeoutTimer = setTimeout(() => {
           runtime.timedOut = true;
-          void Promise.resolve(handle.stop()).catch(() => {}).then(() => {
-            resolve({ exitCode: null, signal: "SIGTERM", error: "task timed out" });
-          });
+          void (async () => {
+            try {
+              await handle.stop();
+            } catch {
+              // The provider is already being terminated; preserve the timeout
+              // result and let the bounded wait below capture cleanup receipt.
+            }
+            const stoppedResult = await Promise.race([
+              Promise.resolve(handle.wait).catch((error) => ({ exitCode: null, signal: null, error: error.message })),
+              delay(5000).then(() => null),
+            ]);
+            resolve(stoppedResult
+              ? { ...stoppedResult, stopRequested: false, error: "task timed out" }
+              : { exitCode: null, signal: "SIGTERM", error: "task timed out" });
+          })();
         }, task.timeoutMs);
       });
       result = await Promise.race([Promise.resolve(handle.wait).catch((error) => ({ exitCode: null, error: error.message })), timeoutPromise]);
@@ -333,10 +351,20 @@ export class ControlPlane {
       if (runtime.providerSessionId === "" && handle.getProviderSessionId) runtime.providerSessionId = handle.getProviderSessionId() || "";
     } catch (error) {
       result = { exitCode: null, signal: null, error: error.message, stdout: "", stderr: "" };
-      this.emit({ taskId, eventType: "provider_error", source: task.agent, payload: { error: error.message } });
+      this.emit({
+        taskId,
+        eventType: "provider_error",
+        source: task.agent,
+        payload: {
+          error: error.message,
+          code: error.code || null,
+          details: error.details || null,
+        },
+      });
     }
     const finalStatus = terminalStatusForResult(result, runtime);
-    const errorText = result?.error || (finalStatus === "failed" ? truncate(result?.stderr || "provider exited with an error", 4000) : null);
+    const errorText = result?.error
+      || (runtime.timedOut ? "task timed out" : finalStatus === "failed" ? truncate(result?.stderr || "provider exited with an error", 4000) : null);
     const finished = this.store.updateTask(taskId, {
       status: finalStatus,
       finishedAt: nowIso(),
@@ -359,6 +387,7 @@ export class ControlPlane {
         providerSessionId: finished.providerSessionId,
         providerJobId: finished.providerJobId,
         error: errorText,
+        permissionCleanup: result?.permissionCleanup || null,
       },
     });
     return finished;

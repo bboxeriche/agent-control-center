@@ -17,6 +17,7 @@ function configForMcp() {
   for (const agent of Object.keys(config.agents)) {
     config.agents[agent] = { ...config.agents[agent], command: process.execPath, args: [fixture, "-p", "{prompt}"] };
   }
+  config.agents.antigravity.permissionMapping = { strategy: "test-double" };
   return config;
 }
 

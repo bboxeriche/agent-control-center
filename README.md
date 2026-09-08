@@ -30,12 +30,18 @@ The durable task contract is:
 
 The same operations are available to Codex through `acc_task_*` MCP tools, including `acc_task_wait`. The existing `after` query/tool field remains a compatibility alias for `afterCursor`.
 
+## DevSpace authenticated client
+
+For the existing `ChatGPT → DevSpace → local` path, register the repository's `server/devspace-mcp-server.mjs` as a local stdio MCP server in DevSpace. Use the command `node` with arguments `server/devspace-mcp-server.mjs` and working directory set to this plugin directory. The adapter starts the local ACC service when needed, reads the local `auth.token` itself, and sends authenticated requests with `x-agent-control-origin: devspace`. The token is never part of the tool schema, prompt, or result.
+
+The DevSpace surface intentionally exposes only the semantic `acc_*` operations needed by a GPT leader: health, agents, task create/list/get/wait/events/reply/stop, discussion create/get/events, and minutes generation. It always forces `origin=devspace`; caller-supplied origin values are ignored. Use a stable `idempotencyKey` for task creation retries and a stable `originRequestId` for request tracing. Keep `AGENT_CONTROL_DATA_DIR`, `AGENT_CONTROL_CONFIG`, `AGENT_CONTROL_ALLOWED_ROOTS`, and `AGENT_CONTROL_DEFAULT_CWD` in the local DevSpace process environment; do not put the token in DevSpace configuration or GPT context.
+
 ## Install the local plugin
 
 The repository includes a local marketplace at `.agents/plugins/marketplace.json`. After the implementation is validated, add that marketplace to Codex and install `agent-control-center` from it. A new Codex task is required for the newly installed MCP tools to be discovered.
 
 ```bash
-codex plugin marketplace add /Users/eriche/Documents/Codex/2026-09-05/ke-y
+codex plugin marketplace add /path/to/ke-y
 codex plugin add agent-control-center@agent-control-local
 ```
 
@@ -62,5 +68,11 @@ Codex CLI uses the same local Codex installation and authentication/configuratio
 Tasks, provider events, discussions, and minutes are stored in SQLite. The append-only `events.jsonl` and `minutes/*.md` files provide a human-readable local record. A discussion runs up to three sequential critique rounds, with agents in each round receiving only bounded prior-round output. Stopping, provider failure, timeout, or service restart is represented in the record and does not get reported as success.
 
 Every task records `origin` (`codex`, `devspace`, `dashboard`, or `local_cli`), optional `originRequestId`, attempt number, permission policy, capability snapshot, and its last durable event cursor. Remote-origin defaults are least privilege at the control-policy layer: write and network access are not granted by the transport. Only capabilities explicitly declared by an adapter are treated as native enforcement; unknown executor boundaries are reported as `limited` rather than simulated.
+
+Origin capability ceilings are configured per client origin and default to disabled for remote callers. An origin may request write or network access only when its configured ceiling enables that capability, the request explicitly enables it, and the canonical filesystem scope remains within `allowedRoots`. The effective policy also remains bounded by the executor's native capability.
+
+Antigravity headless permission mapping is fail-closed and task-scoped. `agy 1.1.27` exposes no safe per-process native permission override, so the default adapter uses a macOS `sandbox-exec` profile plus a per-task local network proxy. The profile is created under a unique task directory, permits writes only under the effective filesystem scope, permits only the provider transport hosts when tool network is denied, and is removed after provider exit/stop/error. The provider's persistent Antigravity settings are never edited; the containment fallback is the only path that adds `--dangerously-skip-permissions`, and it does so only inside that external boundary.
+
+The fallback deliberately refuses `writeAllowed=true, networkAllowed=false`: agy's headless network tool service can execute outside the child process path, so an OS proxy cannot revoke it after skip-permissions is enabled. A no-capability task (`writeAllowed=false, networkAllowed=false`) stays in agy's native `request-review` mode and real headless denials remain visible. Network-enabled tasks use the external write boundary; writes outside scope remain denied. The profile currently keeps file reads broad because agy 1.1.27 aborts with narrow read subpaths during startup, so this adapter claims hard enforcement for writes, network routing, settings non-mutation, and cleanup—not a narrower read boundary.
 
 Follow-up on a completed task reuses the same `taskId`, increments `attemptNo`, preserves the provider session reference when the adapter supports resume, and appends new observable events. This keeps cross-client lookup stable while allowing provider-specific resume limitations to remain visible.

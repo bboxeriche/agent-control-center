@@ -22,6 +22,7 @@ function fakeConfig() {
       env: { ...process.env, FAKE_AGENT_SESSION: `session-${agent}` },
     };
   }
+  config.agents.antigravity.permissionMapping = { strategy: "test-double" };
   return config;
 }
 

@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
+import { prepareAntigravityContainment, ANTIGRAVITY_CONTAINMENT_STRATEGY } from "./antigravity-containment.mjs";
+import { NativePermissionMappingUnavailableError } from "./antigravity-permissions.mjs";
 import { capabilitiesFor, fillTemplateArgs, parseProviderLine, redactSecrets, truncate } from "./core.mjs";
 
 function lineDecoder(onLine) {
@@ -185,16 +187,79 @@ export class CliAdapter {
       label: this.config.label || this.agentId,
       kind: "cli",
       command: this.config.command,
+      permissionMapping: this.config.permissionMapping || { strategy: "unknown" },
       capabilities: capabilitiesFor(this.agentId, { agents: { [this.agentId]: this.config } }),
       ...probe,
     };
   }
 
   start(spec, onEvent) {
-    const args = commandArgs(this.config, spec);
-    const child = spawn(this.config.command, args, {
+    if (this.agentId === "antigravity" && this.config.permissionMapping?.strategy === ANTIGRAVITY_CONTAINMENT_STRATEGY) {
+      return this.startContained(spec, onEvent);
+    }
+    if (this.agentId === "antigravity" && spec.permissionPolicy && this.config.permissionMapping?.strategy !== "test-double") {
+      // agy 1.1.27 has no per-process native permission override. Do not let a
+      // persistent provider grant drift away from ACC's task policy.
+      throw new NativePermissionMappingUnavailableError(spec.permissionPolicy);
+    }
+
+    return this.startProcess(spec, onEvent, {
+      command: this.config.command,
+      args: commandArgs(this.config, spec),
+      env: this.config.env,
+    });
+  }
+
+  async startContained(spec, onEvent) {
+    const effective = spec.permissionPolicy?.effective || spec.permissionPolicy || {};
+    // The external proxy can safely permit network=true and the macOS sandbox
+    // can safely deny writes outside scope. It cannot revoke agy's own
+    // headless network tool service after --dangerously-skip-permissions has
+    // approved it. Refuse the unsafe write=true/network=false quadrant rather
+    // than pretending that a prompt-level policy is an OS boundary.
+    if (effective.writeAllowed === true && effective.networkAllowed !== true) {
+      throw new NativePermissionMappingUnavailableError(
+        spec.permissionPolicy,
+        "task-scoped fallback cannot revoke agy's headless network tool while approving writes",
+      );
+    }
+    const containment = await prepareAntigravityContainment({
+      taskId: spec.taskId,
       cwd: spec.cwd,
-      env: { ...process.env, ...(this.config.env || {}) },
+      permissionPolicy: spec.permissionPolicy,
+      config: this.config.permissionMapping,
+      command: this.config.command,
+    });
+    try {
+      return this.startProcess(spec, onEvent, {
+        command: containment.sandboxExecutable,
+        args: containment.argsFor(commandArgs(this.config, spec), {
+          // With no capabilities requested, leave agy in its own headless
+          // request-review mode so native write/network requests are denied.
+          // Any policy that needs a capability uses the skip flag, with the
+          // external sandbox enforcing the remaining filesystem boundary.
+          skipPermissions: effective.writeAllowed === true || effective.networkAllowed === true,
+        }),
+        env: { ...this.config.env, ...containment.env },
+        cleanup: containment.cleanup,
+        permissionReceipt: containment.permissionReceipt,
+      });
+    } catch (error) {
+      await containment.cleanup("spawn_error").catch(() => {});
+      throw error;
+    }
+  }
+
+  startProcess(spec, onEvent, {
+    command,
+    args,
+    env,
+    cleanup = null,
+    permissionReceipt = null,
+  }) {
+    const child = spawn(command, args, {
+      cwd: spec.cwd,
+      env: { ...process.env, ...(env || {}) },
       stdio: [this.config.stdin === "ignore" ? "ignore" : "pipe", "pipe", "pipe"],
     });
     // These adapters are non-interactive by contract. Closing stdin prevents
@@ -206,6 +271,7 @@ export class CliAdapter {
     let semanticError = "";
     let stopRequested = false;
     let settled = false;
+    let finishing = false;
     let resolveWait;
     const wait = new Promise((resolve) => {
       resolveWait = resolve;
@@ -237,6 +303,31 @@ export class CliAdapter {
       stderr += chunk.toString("utf8");
       stderrLines.push(chunk);
     });
+    const finish = async (result) => {
+      if (finishing) return;
+      finishing = true;
+      let cleanupResult = null;
+      let cleanupError = null;
+      if (cleanup) {
+        try {
+          cleanupResult = await cleanup(result.stopRequested ? "stopped" : result.error ? "provider_error" : "task_finished");
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
+      settled = true;
+      const errorText = cleanupError
+        ? `permission containment cleanup failed: ${cleanupError.message}`
+        : semanticError || result.error || null;
+      resolveWait({
+        ...result,
+        error: errorText,
+        permissionCleanup: cleanupResult,
+        sessionId: providerSessionId,
+        stdout: redactSecrets(stdout),
+        stderr: redactSecrets(stderr),
+      });
+    };
     child.on("error", (error) => {
       stderr += error.message;
       emitSafely(onEvent, {
@@ -245,34 +336,27 @@ export class CliAdapter {
         text: error.message,
         payload: { error: error.message },
       });
-      if (!settled) {
-        settled = true;
-        resolveWait({ exitCode: null, signal: null, error: error.message, sessionId: providerSessionId, stdout, stderr });
-      }
+      void finish({ exitCode: null, signal: null, error: error.message, stopRequested });
     });
     child.on("close", (exitCode, signal) => {
       stdoutLines.flush();
       stderrLines.flush();
-      if (settled) return;
-      settled = true;
-      resolveWait({
+      void finish({
         exitCode,
         signal,
         error: semanticError || null,
         stopRequested,
-        sessionId: providerSessionId,
-        stdout: redactSecrets(stdout),
-        stderr: redactSecrets(stderr),
       });
     });
     return {
       provider: "cli",
       pid: child.pid,
       args,
+      permissionReceipt,
       getProviderSessionId: () => providerSessionId,
       wait,
       async stop() {
-        if (settled) return;
+        if (settled || finishing) return;
         stopRequested = true;
         child.kill("SIGTERM");
         await delay(2000);
