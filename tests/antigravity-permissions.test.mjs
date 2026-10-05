@@ -78,6 +78,28 @@ test("uses task-scoped external containment when native agy mapping is unavailab
       request.end();
     });
     assert.equal(denied, 403);
+
+    const insidePath = join(scopeA, ".acc-pty-contained-write-probe");
+    const insideWrite = spawnSync("/usr/bin/sandbox-exec", [
+      "-f", first.profilePath, "/bin/sh", "-c",
+      `printf scoped > ${JSON.stringify(insidePath)} && cat ${JSON.stringify(insidePath)}`,
+    ], { encoding: "utf8", timeout: 10000 });
+    assert.equal(insideWrite.status, 0, insideWrite.stderr || "in-scope write/read must succeed");
+    assert.equal(insideWrite.stdout, "scoped");
+    const insideCleanup = spawnSync("/usr/bin/sandbox-exec", [
+      "-f", first.profilePath, "/bin/sh", "-c",
+      `rm ${JSON.stringify(insidePath)} && test ! -e ${JSON.stringify(insidePath)}`,
+    ], { encoding: "utf8", timeout: 10000 });
+    assert.equal(insideCleanup.status, 0, insideCleanup.stderr || "in-scope probe cleanup must succeed");
+    assert.equal(existsSync(insidePath), false);
+
+    const outsidePath = join(scopeB, ".acc-pty-outside-write-probe");
+    const outsideWrite = spawnSync("/usr/bin/sandbox-exec", [
+      "-f", first.profilePath, "/bin/sh", "-c",
+      `printf escaped > ${JSON.stringify(outsidePath)}`,
+    ], { encoding: "utf8", timeout: 10000 });
+    assert.notEqual(outsideWrite.status, 0, "write outside the canonical scope must be denied");
+    assert.equal(existsSync(outsidePath), false);
   } finally {
     await Promise.all([first.cleanup("test"), second.cleanup("test")]);
     rmSync(root, { recursive: true, force: true });
@@ -116,6 +138,116 @@ test("profile has bounded writes and never grants Antigravity settings writes", 
   assert.doesNotMatch(profile, /settings\.json/);
   assert.doesNotMatch(profile, /\.gemini\/config/);
   assert.match(profile, /network-outbound \(remote tcp "localhost:43210"\)/);
+});
+
+test("profile grants only the PTY master and extension-authorized slave access", () => {
+  const profile = buildSandboxProfile({
+    filesystemScope: [workspace],
+    writeAllowed: true,
+    networkProxyPort: 43210,
+    runtimeRoot: join(homedir(), ".gemini", "antigravity-cli"),
+    command: "/bin/sh",
+  });
+  const deviceRules = profile.split("\n").filter((line) =>
+    line.includes("/dev/") || line.includes("pseudo-tty") || line.includes("com.apple.sandbox.pty"));
+  assert.deepEqual(deviceRules, [
+    '(allow file-write* (literal "/dev/null"))',
+    "(allow pseudo-tty)",
+    '(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))',
+    '(allow file-read* file-write* (require-all (regex #"^/dev/ttys[0-9]+$") (extension "com.apple.sandbox.pty")))',
+    '(allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]+$") (extension "com.apple.sandbox.pty")))',
+  ]);
+  assert.equal(profile.split("\n").filter((line) => line.includes("file-ioctl")).length, 2);
+  assert.match(profile, /^\(deny default\)$/m);
+});
+
+test("macOS PTY regression: old profile denies allocation and the bounded profile runs echo", (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("sandbox-exec PTY regression is macOS-specific");
+    return;
+  }
+  const python = spawnSync("python3", ["--version"], { encoding: "utf8", timeout: 5000 });
+  if (python.status !== 0) {
+    t.skip("python3 is required to exercise openpty directly");
+    return;
+  }
+
+  const root = mkdtempSync(join(tmpdir(), "acc-pty-regression-"));
+  const scope = join(root, "scope");
+  const taskRoot = join(root, "task");
+  mkdirSync(scope);
+  mkdirSync(taskRoot);
+  const profile = buildSandboxProfile({
+    filesystemScope: [scope],
+    writeAllowed: false,
+    networkProxyPort: 43210,
+    runtimeRoot: join(root, "antigravity-runtime"),
+    taskRoot,
+    command: "/bin/sh",
+  });
+  const expectedPtyRules = [
+    "(allow pseudo-tty)",
+    '(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))',
+    '(allow file-read* file-write* (require-all (regex #"^/dev/ttys[0-9]+$") (extension "com.apple.sandbox.pty")))',
+    '(allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]+$") (extension "com.apple.sandbox.pty")))',
+  ];
+  const baseline = profile.split("\n").filter((line) => !expectedPtyRules.includes(line)).join("\n");
+  const withoutSlaveIoctl = profile.split("\n").filter((line) => line !== expectedPtyRules[3]).join("\n");
+  const ptyEcho = [
+    "import os, pty, fcntl, termios",
+    "master_fd, slave_fd = pty.openpty()",
+    "pid = os.fork()",
+    "if pid == 0:",
+    "    os.close(master_fd)",
+    "    stage = 'setsid'",
+    "    try:",
+    "        os.setsid()",
+    "        stage = 'ioctl-TIOCSCTTY'",
+    "        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)",
+    "        stage = 'dup2'",
+    "        os.dup2(slave_fd, 0); os.dup2(slave_fd, 1); os.dup2(slave_fd, 2)",
+    "        stage = 'execve-zsh'",
+    "        os.execv('/bin/zsh', ['/bin/zsh', '-c', 'echo HELLO'])",
+    "    except BaseException as error:",
+    "        os.write(2, (stage + ': ' + str(error) + '\\n').encode())",
+    "        os._exit(127)",
+    "os.close(slave_fd)",
+    "output = bytearray()",
+    "while True:",
+    "    try:",
+    "        chunk = os.read(master_fd, 4096)",
+    "    except OSError:",
+    "        break",
+    "    if not chunk:",
+    "        break",
+    "    output.extend(chunk)",
+    "_, status = os.waitpid(pid, 0)",
+    "print(output.decode('utf-8', errors='replace'), end='')",
+    "print('PTY_ECHO_RC=' + str(os.waitstatus_to_exitcode(status)))",
+  ].join("\n");
+  const env = { PATH: process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin", LANG: "C" };
+  const run = (sandboxProfile) => spawnSync(
+    "/usr/bin/sandbox-exec",
+    ["-p", sandboxProfile, "python3", "-c", ptyEcho],
+    { encoding: "utf8", timeout: 15000, env },
+  );
+  try {
+    const before = run(baseline);
+    assert.notEqual(before.status, 0, "the profile without PTY grants must deny openpty");
+    assert.match(before.stderr, /out of pty devices|Operation not permitted|EPERM/i);
+
+    const missingIoctl = run(withoutSlaveIoctl);
+    assert.equal(missingIoctl.status, 0, missingIoctl.stderr);
+    assert.match(missingIoctl.stderr, /ioctl-TIOCSCTTY: \[Errno 1\] Operation not permitted/);
+    assert.match(missingIoctl.stdout, /PTY_ECHO_RC=127/);
+
+    const after = run(profile);
+    assert.equal(after.status, 0, after.stderr || "contained PTY echo must succeed");
+    assert.match(after.stdout, /HELLO/);
+    assert.match(after.stdout, /PTY_ECHO_RC=0/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("reports native, mapping, external, and effective Antigravity capability layers", () => {
@@ -170,7 +302,7 @@ test("enforces the default sensitive-path deny policy on disposable fixtures", (
   const root = mkdtempSync(join(tmpdir(), "acc-sensitive-fixture-"));
   const fixture = join(root, "workspace");
   mkdirSync(fixture);
-  for (const [name, content] of [["normal.txt", "safe\n"], [".env", "secret\n"], ["private.pem", "secret\n"], ["credentials.json", "secret\n"]]) {
+  for (const [name, content] of [["normal.txt", "safe\n"], [".env", "secret\n"], ["private.pem", "secret\n"], ["private.key", "secret\n"], ["credentials.json", "secret\n"]]) {
     writeFileSync(join(fixture, name), content);
   }
   const profilePath = join(root, "deny.sb");
@@ -191,10 +323,12 @@ test("enforces the default sensitive-path deny policy on disposable fixtures", (
   try {
     const read = (profile, name) => spawnSync("/usr/bin/sandbox-exec", ["-f", profile, "/bin/cat", join(fixture, name)], { encoding: "utf8" });
     assert.equal(read(profilePath, "normal.txt").status, 0);
-    for (const name of [".env", "private.pem", "credentials.json"]) assert.notEqual(read(profilePath, name).status, 0);
-    const sandboxedWrite = spawnSync("/usr/bin/sandbox-exec", ["-f", profilePath, "/bin/sh", "-c", `printf changed > ${JSON.stringify(join(fixture, ".env"))}`], { encoding: "utf8" });
-    assert.notEqual(sandboxedWrite.status, 0);
-    assert.equal(readFileSync(join(fixture, ".env"), "utf8"), "secret\n");
+    for (const name of [".env", "private.pem", "private.key", "credentials.json"]) assert.notEqual(read(profilePath, name).status, 0);
+    for (const name of [".env", "private.key"]) {
+      const sandboxedWrite = spawnSync("/usr/bin/sandbox-exec", ["-f", profilePath, "/bin/sh", "-c", `printf changed > ${JSON.stringify(join(fixture, name))}`], { encoding: "utf8" });
+      assert.notEqual(sandboxedWrite.status, 0);
+      assert.equal(readFileSync(join(fixture, name), "utf8"), "secret\n");
+    }
     assert.equal(read(overrideProfilePath, ".env").status, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });

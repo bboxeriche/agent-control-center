@@ -162,6 +162,14 @@ export function buildSandboxProfile({
     ...runtime.directories.map((path) => profileRule("file-write*", "subpath", path)),
     ...runtime.literals.map((path) => profileRule("file-write*", "literal", path)),
     profileRule("file-write*", "literal", "/dev/null"),
+    // agy's run_command allocates a nested PTY inside this sandbox. Grant the
+    // PTY operation, its literal master device, and only extension-authorized
+    // read/write/ioctl access to sandbox-created slave nodes. Other /dev paths
+    // remain denied by the default rule.
+    "(allow pseudo-tty)",
+    '(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))',
+    '(allow file-read* file-write* (require-all (regex #"^/dev/ttys[0-9]+$") (extension "com.apple.sandbox.pty")))',
+    '(allow file-read* file-write* file-ioctl (require-all (regex #"^/dev/ttys[0-9]+$") (extension "com.apple.sandbox.pty")))',
     profileRule("network-outbound", "remote tcp", networkProxyWildcard ? "localhost:*" : `localhost:${Number(networkProxyPort)}`),
     profileRule("network-inbound", "local tcp", "localhost:*"),
     // The macOS Security framework resolves the login keychain through a

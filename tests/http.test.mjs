@@ -103,3 +103,51 @@ test("waits for contained provider cleanup before finalizing a timed-out task", 
     ]);
   }
 });
+
+test("cleans Antigravity containment after a stopped task", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("sandbox-exec fallback is macOS-specific");
+    return;
+  }
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-stop-containment-data-"));
+  const taskRoot = await mkdtemp(join(tmpdir(), "acc-stop-containment-root-"));
+  const config = defaultConfig();
+  config.allowedRoots = [process.cwd()];
+  config.defaultTimeoutMs = 15000;
+  config.agents.antigravity = {
+    ...config.agents.antigravity,
+    command: process.execPath,
+    args: [fixture, "-p", "{prompt}"],
+    env: { ...process.env, FAKE_AGENT_DELAY_MS: "10000" },
+    permissionMapping: {
+      strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY,
+      taskRoot,
+      providerHosts: [],
+    },
+  };
+  const plane = new ControlPlane({ dataDir, config });
+  try {
+    const task = plane.createTask({
+      agent: "antigravity",
+      prompt: "hold until explicitly stopped",
+      cwd: process.cwd(),
+      origin: "devspace",
+    });
+    for (let attempt = 0; attempt < 200 && !plane.runtime.get(task.id)?.handle; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(plane.getTask(task.id).status, "running");
+    assert.ok(plane.runtime.get(task.id)?.handle, "provider handle should be available before stop");
+    const stopped = await plane.stopTask(task.id);
+    assert.equal(stopped.status, "stopped");
+    const completion = plane.listTaskEvents(task.id, 0).find((event) => event.eventType === "task_finished");
+    assert.equal(completion?.payload?.permissionCleanup?.state, "cleaned");
+    assert.deepEqual(await readdir(taskRoot), []);
+  } finally {
+    await plane.shutdown();
+    await Promise.all([
+      rm(dataDir, { recursive: true, force: true }),
+      rm(taskRoot, { recursive: true, force: true }),
+    ]);
+  }
+});

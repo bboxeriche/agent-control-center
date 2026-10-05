@@ -32,6 +32,13 @@ are removed after completion, stop, error, or timeout. File reads remain broad
 because the provider aborts during startup when narrow read subpaths are used;
 this limitation is included in capability receipts.
 
+The profile permits Antigravity's nested `run_command` PTY using the
+`pseudo-tty` operation, read/write/ioctl on the literal `/dev/ptmx` master, and
+read/write/ioctl on `/dev/ttys[0-9]+` only when the
+`com.apple.sandbox.pty` extension is present. That extension confines slave
+access to sandbox-created PTYs; no other TTY or general `/dev` access is
+granted, and all other device access remains denied by default.
+
 ## Tencent WorkBuddy boundary
 
 WorkBuddy/CodeBuddy `2.106.4` is invoked with the per-run
