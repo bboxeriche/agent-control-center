@@ -351,6 +351,7 @@ export class ControlPlane {
         taskId,
         prompt: task.prompt,
         cwd: task.cwd,
+        timeoutMs: task.timeoutMs,
         model: task.model,
         sessionId: task.providerSessionId,
         permissionPolicy: task.permissionPolicy,

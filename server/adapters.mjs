@@ -82,6 +82,38 @@ function commandArgs(config, spec) {
   return args;
 }
 
+function antigravityPrintTimeoutDuration(timeoutMs) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 2) {
+    throw new RangeError("Antigravity requires a positive ACC task timeout in milliseconds");
+  }
+  // Keep a fixed five-second collection/cleanup margin for normal tasks. For
+  // short tasks, reserve half the outer budget so the provider duration stays
+  // positive and strictly below ACC's authoritative timeout.
+  const marginMs = Math.min(5000, Math.floor(timeoutMs / 2));
+  let remainingMs = timeoutMs - marginMs;
+  const parts = [];
+  for (const [unit, sizeMs] of [["h", 3_600_000], ["m", 60_000], ["s", 1000], ["ms", 1]]) {
+    const amount = Math.floor(remainingMs / sizeMs);
+    if (amount > 0) {
+      parts.push(`${amount}${unit}`);
+      remainingMs -= amount * sizeMs;
+    }
+  }
+  return parts.join("");
+}
+
+function antigravityCommandArgs(config, spec) {
+  const args = commandArgs(config, spec);
+  // Replace any configured value so the per-task ACC ceiling always wins and
+  // the provider can never silently retain agy's default five-minute timer.
+  for (let index = args.length - 1; index >= 0; index -= 1) {
+    if (args[index] === "--print-timeout") args.splice(index, 2);
+    else if (args[index].startsWith("--print-timeout=")) args.splice(index, 1);
+  }
+  args.push("--print-timeout", antigravityPrintTimeoutDuration(spec.timeoutMs));
+  return args;
+}
+
 const PROVIDER_FAILURE_STATUSES = new Set([
   "error",
   "failed",
@@ -392,7 +424,9 @@ export class CliAdapter {
 
     return this.startProcess(spec, onEvent, {
       command: this.config.command,
-      args: commandArgs(this.config, spec),
+      args: this.agentId === "antigravity"
+        ? antigravityCommandArgs(this.config, spec)
+        : commandArgs(this.config, spec),
       env: this.config.env,
     });
   }
@@ -420,7 +454,7 @@ export class CliAdapter {
     try {
       return this.startProcess(spec, onEvent, {
         command: containment.sandboxExecutable,
-        args: containment.argsFor(commandArgs(this.config, spec), {
+        args: containment.argsFor(antigravityCommandArgs(this.config, spec), {
           // With no capabilities requested, leave agy in its own headless
           // request-review mode so native write/network requests are denied.
           // Any policy that needs a capability uses the skip flag, with the
