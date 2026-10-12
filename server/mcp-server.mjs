@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
-import { DEFAULT_HOST, DEFAULT_PORT, SERVICE_VERSION, SUPPORTED_ORIGINS, loadConfig, readAuthToken, resolveDataDir } from "./core.mjs";
+import { DEFAULT_HOST, DEFAULT_PORT, MAX_TASK_TIMEOUT_MS, SERVICE_VERSION, SUPPORTED_ORIGINS, loadConfig, readAuthToken, resolveDataDir } from "./core.mjs";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const servicePath = fileURLToPath(new URL("./service.mjs", import.meta.url));
@@ -89,7 +89,7 @@ const tools = [
         prompt: { type: "string", minLength: 1 },
         cwd: { type: "string", description: "Absolute repository working directory." },
         model: { type: "string", description: "Provider-specific model identifier passed literally to --model; examples on this host are gpt-5.6-luna, hy4-preview, or gemini-3.8-flash-high." },
-        timeoutMs: { type: "integer", minimum: 1000 },
+        timeoutMs: { type: "integer", minimum: 1000, maximum: MAX_TASK_TIMEOUT_MS, description: "Per-attempt budget; defaults to the service's 60-minute budget unless configured otherwise. Explicit shorter budgets are preserved." },
         origin: { type: "string", enum: SUPPORTED_ORIGINS },
         originRequestId: { type: "string" },
         idempotencyKey: { type: "string" },
@@ -139,7 +139,7 @@ const tools = [
   {
     name: "acc_task_reply",
     description: "Send a follow-up to a running provider session when supported, or queue another attempt on the same durable task ID after completion.",
-    inputSchema: { type: "object", required: ["taskId", "prompt"], properties: { taskId: { type: "string" }, prompt: { type: "string", minLength: 1 }, origin: { type: "string", enum: SUPPORTED_ORIGINS }, originRequestId: { type: "string" } }, additionalProperties: false },
+    inputSchema: { type: "object", required: ["taskId", "prompt"], properties: { taskId: { type: "string" }, prompt: { type: "string", minLength: 1 }, timeoutMs: { type: "integer", minimum: 1000, maximum: MAX_TASK_TIMEOUT_MS, description: "Optional budget for a completed task's next attempt; cannot change an active attempt's timer." }, origin: { type: "string", enum: SUPPORTED_ORIGINS }, originRequestId: { type: "string" } }, additionalProperties: false },
   },
   {
     name: "acc_discussion_create",
@@ -229,7 +229,7 @@ async function callTool(name, args = {}) {
     case "acc_task_stop":
       return api(`/api/tasks/${encodeURIComponent(args.taskId)}/stop`, { method: "POST", body: {} });
     case "acc_task_reply":
-      return api(`/api/tasks/${encodeURIComponent(args.taskId)}/reply`, { method: "POST", body: { prompt: args.prompt, origin: args.origin || "codex", originRequestId: args.originRequestId } });
+      return api(`/api/tasks/${encodeURIComponent(args.taskId)}/reply`, { method: "POST", body: { prompt: args.prompt, timeoutMs: args.timeoutMs, origin: args.origin || "codex", originRequestId: args.originRequestId } });
     case "acc_discussion_create":
       return api("/api/discussions", { method: "POST", body: { ...args, origin: args.origin || "codex" } });
     case "acc_discussion_list":

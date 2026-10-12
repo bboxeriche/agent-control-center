@@ -61,6 +61,125 @@ test("serves health, task creation, task status, and dashboard", async () => {
   }
 });
 
+test("streams authenticated lifecycle invalidations without provider output and removes disconnected listeners", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-dashboard-activity-"));
+  const running = await startControlServer({ host: "127.0.0.1", port: 0, dataDir, config: fakeConfig() });
+  const baseUrl = `http://${running.host}:${running.port}`;
+  let reader;
+  try {
+    assert.equal((await fetch(`${baseUrl}/api/activity/stream`)).status, 401);
+    assert.equal((await fetch(`${baseUrl}/api/activity/stream`, { headers: { origin: "https://foreign.example" } })).status, 403);
+    const agents = await fetch(`${baseUrl}/api/agents?cached=1`, { headers: { authorization: `Bearer ${running.plane.authToken}` } }).then((response) => response.json());
+    assert.equal(agents.taskOptions.defaultTimeoutMs, 5000);
+    assert.equal(agents.taskOptions.maxTimeoutMs, 86_400_000);
+    const stream = await fetch(`${baseUrl}/api/activity/stream`, { headers: { authorization: `Bearer ${running.plane.authToken}` }, signal: AbortSignal.timeout(5000) });
+    assert.match(stream.headers.get("content-type"), /text\/event-stream/);
+    reader = stream.body.getReader();
+    const decode = new TextDecoder();
+    let body = decode.decode((await reader.read()).value);
+    assert.match(body, /event: ready/);
+    assert.equal(running.plane.hub.listeners.size, 1);
+    const task = running.plane.createTask({ agent: "claude-code", cwd: process.cwd(), prompt: "private provider fixture must not appear in activity" });
+    while (!body.includes('"eventType":"task_finished"')) {
+      const chunk = await reader.read();
+      assert.equal(chunk.done, false);
+      body += decode.decode(chunk.value);
+    }
+    assert.match(body, new RegExp(task.id));
+    assert.match(body, /"eventType":"task_created"/);
+    assert.doesNotMatch(body, /provider_message|Recommendation:|private provider fixture/);
+    assert.equal(running.plane.getTask(task.id).status, "succeeded", "invalidation follows durable finalization");
+    await reader.cancel();
+    reader = null;
+    for (let i = 0; i < 100 && running.plane.hub.listeners.size; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(running.plane.hub.listeners.size, 0);
+  } finally {
+    if (reader) await reader.cancel();
+    await running.close();
+  }
+});
+
+test("service shutdown closes a connected Dashboard activity stream", async () => {
+  const running = await startControlServer({ host: "127.0.0.1", port: 0, dataDir: await mkdtemp(join(tmpdir(), "acc-stream-shutdown-")), config: fakeConfig() });
+  const stream = await fetch(`http://${running.host}:${running.port}/api/activity/stream`, { headers: { authorization: `Bearer ${running.plane.authToken}` }, signal: AbortSignal.timeout(5000) });
+  const reader = stream.body.getReader();
+  await reader.read();
+  const closing = running.close();
+  assert.equal((await reader.read()).done, true);
+  await closing;
+  assert.equal(running.plane.hub.listeners.size, 0);
+});
+
+test("serves task summaries and policy preview, and fixes Dashboard task origin despite spoofed body metadata", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-dashboard-contract-"));
+  const config = fakeConfig();
+  config.allowedRoots = [process.cwd()];
+  config.agents["claude-code"].args = ["-e", "process.stdout.write(JSON.stringify({type:'system',session_id:'http-session'})+'\\n'+JSON.stringify({type:'result',result:'dashboard provider final'})+'\\n')"];
+  const running = await startControlServer({ host: "127.0.0.1", port: 0, dataDir, config });
+  const baseUrl = `http://${running.host}:${running.port}`;
+  try {
+    const page = await fetch(`${baseUrl}/`);
+    const cookie = page.headers.get("set-cookie");
+    const previewResponse = await fetch(`${baseUrl}/api/policy-preview?agent=claude-code&cwd=${encodeURIComponent(process.cwd())}`, { headers: { cookie } });
+    assert.equal(previewResponse.status, 200);
+    const preview = await previewResponse.json();
+    assert.equal(preview.origin, "dashboard");
+    assert.equal(preview.permissionPolicy.effective.writeAllowed, false);
+
+    const createdResponse = await fetch(`${baseUrl}/api/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: baseUrl },
+      body: JSON.stringify({ agent: "claude-code", prompt: "dashboard constrained task", cwd: process.cwd(), origin: "codex", permissionPolicy: { writeAllowed: true, networkAllowed: true } }),
+    });
+    assert.equal(createdResponse.status, 202);
+    const created = await createdResponse.json();
+    assert.equal(created.task.origin, "dashboard");
+    assert.equal(created.task.permissionPolicy.effective.writeAllowed, false);
+    assert.equal(created.task.permissionPolicy.effective.networkAllowed, false);
+    assert.equal(created.resultSummary.permission.origin, "dashboard");
+    assert.equal(created.resultSummary.mechanicalOutcome.outcome, "not_recorded");
+    await waitForTask(baseUrl, created.task.id, running.plane.authToken);
+    const waited = await fetch(`${baseUrl}/api/tasks/${encodeURIComponent(created.task.id)}/wait?timeoutMs=1000`, { headers: { authorization: `Bearer ${running.plane.authToken}` } }).then((response) => response.json());
+    assert.equal(waited.resultSummary.status, "succeeded");
+    assert.equal(waited.resultSummary.mechanicalOutcome.outcome, "succeeded");
+    assert.equal(waited.resultSummary.permission.effective.writeAllowed, false);
+    assert.equal(waited.resultSummary.providerFinalAnswerEvidence.source, "provider_final_event");
+    assert.match(waited.resultSummary.providerFinalAnswerEvidence.preview, /dashboard provider final/);
+    assert.equal(waited.resultSummary.providerFinalAnswerEvidence.semanticVerification, "not_performed");
+
+    const summaryResponse = await fetch(`${baseUrl}/api/task-summaries?limit=1&query=dashboard`, { headers: { cookie } });
+    assert.equal(summaryResponse.status, 200);
+    const summary = await summaryResponse.json();
+    assert.equal(summary.total, 1);
+    assert.equal(summary.tasks[0].id, created.task.id);
+    assert.equal(summary.tasks[0].hasProviderSessionId, true);
+
+    const discussionResponse = await fetch(`${baseUrl}/api/discussions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: baseUrl },
+      body: JSON.stringify({ prompt: "dashboard discussion", cwd: process.cwd(), agents: ["claude-code"], rounds: 1, origin: "codex" }),
+    });
+    assert.equal(discussionResponse.status, 202);
+    const { discussion } = await discussionResponse.json();
+    assert.equal(discussion.origin, "dashboard");
+    const discussionWithTask = await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 5000;
+      const poll = () => {
+        const current = running.plane.getDiscussion(discussion.id);
+        if (current.tasks.length) return resolve(current);
+        if (Date.now() >= deadline) return reject(new Error("discussion task was not created"));
+        setTimeout(poll, 20);
+      };
+      poll();
+    });
+    const discussionTask = discussionWithTask.tasks[0];
+    assert.equal(discussionTask.origin, "dashboard");
+    assert.equal(discussionTask.permissionPolicy.effective.writeAllowed, false);
+  } finally {
+    await running.close();
+  }
+});
+
 test("waits for contained provider cleanup before finalizing a timed-out task", async (t) => {
   if (process.platform !== "darwin") {
     t.skip("sandbox-exec fallback is macOS-specific");

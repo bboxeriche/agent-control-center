@@ -86,10 +86,10 @@ function antigravityPrintTimeoutDuration(timeoutMs) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 2) {
     throw new RangeError("Antigravity requires a positive ACC task timeout in milliseconds");
   }
-  // Keep a fixed five-second collection/cleanup margin for normal tasks. For
-  // short tasks, reserve half the outer budget so the provider duration stays
-  // positive and strictly below ACC's authoritative timeout.
-  const marginMs = Math.min(5000, Math.floor(timeoutMs / 2));
+  // Provider startup and final-output collection can exceed five seconds.
+  // Reserve 5% (at least five seconds, at most one minute) for normal runs;
+  // short tasks still keep a positive duration below ACC's outer watchdog.
+  const marginMs = Math.min(Math.floor(timeoutMs / 2), Math.max(5000, Math.min(60000, Math.floor(timeoutMs / 20))));
   let remainingMs = timeoutMs - marginMs;
   const parts = [];
   for (const [unit, sizeMs] of [["h", 3_600_000], ["m", 60_000], ["s", 1000], ["ms", 1]]) {
@@ -363,6 +363,11 @@ function emitSafely(onEvent, event) {
   }
 }
 
+function extractProviderVersion(output) {
+  const match = String(output || "").match(/(?:^|[^0-9A-Za-z])v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?![0-9A-Za-z.-])/);
+  return match?.[1] || null;
+}
+
 export class CliAdapter {
   constructor(agentId, config) {
     this.agentId = agentId;
@@ -379,17 +384,42 @@ export class CliAdapter {
     const modelReport = this.agentId === "tencent-workbuddy"
       ? workBuddyModelReport(this.config)
       : {};
+    const observedProviderVersion = this.agentId === "tencent-workbuddy" ? extractProviderVersion(probe.version) : null;
+    const providerVersionValidation = this.agentId === "tencent-workbuddy"
+      ? {
+        status: !probe.available ? "probe_unavailable" : !observedProviderVersion ? "unparseable" : observedProviderVersion === modelReport.providerVersion ? "version_match" : "version_mismatch",
+        validatedProviderVersion: modelReport.providerVersion,
+        observedProviderVersion,
+      }
+      : null;
+    const reportedCapabilityReport = capabilityReport && providerVersionValidation
+      ? {
+        ...capabilityReport,
+        providerVersionValidation,
+        executionProfiles: Object.fromEntries(Object.entries(capabilityReport.executionProfiles || {}).map(([key, profile]) => [
+          key,
+          {
+            ...profile,
+            ...(profile.status === "SUPPORTED" && providerVersionValidation.status !== "version_match"
+              ? { status: "UNVERIFIED", configuredStatus: profile.status, code: "workbuddy_provider_version_unverified" }
+              : {}),
+            providerVersionValidation,
+          },
+        ])),
+      }
+      : capabilityReport;
     return {
       agent: this.agentId,
       label: this.config.label || this.agentId,
       kind: "cli",
       command: this.config.command,
-      permissionMapping: capabilityReport
-        ? { ...(this.config.permissionMapping || { strategy: "unknown" }), capabilityReport }
+      permissionMapping: reportedCapabilityReport
+        ? { ...(this.config.permissionMapping || { strategy: "unknown" }), capabilityReport: reportedCapabilityReport }
         : this.config.permissionMapping || { strategy: "unknown" },
-      capabilityReport,
+      capabilityReport: reportedCapabilityReport,
       capabilities: capabilitiesFor(this.agentId, { agents: { [this.agentId]: this.config } }),
       ...modelReport,
+      ...(providerVersionValidation ? { observedProviderVersion, providerVersionValidation } : {}),
       ...probe,
     };
   }

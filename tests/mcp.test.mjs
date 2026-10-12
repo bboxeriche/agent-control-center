@@ -91,6 +91,7 @@ test("speaks MCP over stdio and exposes the control tools", async () => {
     assert.equal(called.result.isError, undefined);
     const created = JSON.parse(called.result.content[0].text);
     assert.match(created.task.id, /^task_/);
+    assert.equal(created.resultSummary.permission.origin, "codex");
     const authToken = readAuthToken(dataDir);
     const devspaceView = await fetch(`${baseUrl}/api/tasks/${encodeURIComponent(created.task.id)}`, {
       headers: { authorization: `Bearer ${authToken}` },
@@ -99,7 +100,9 @@ test("speaks MCP over stdio and exposes the control tools", async () => {
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "acc_task_wait", arguments: { taskId: created.task.id, timeoutMs: 1000 } } })}\n`);
     const waited = await nextResponse(child, 4);
     assert.equal(waited.result.isError, undefined);
-    assert.equal(JSON.parse(waited.result.content[0].text).task.id, created.task.id);
+    const waitPayload = JSON.parse(waited.result.content[0].text);
+    assert.equal(waitPayload.task.id, created.task.id);
+    assert.equal(waitPayload.resultSummary.taskId, created.task.id);
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const current = await fetch(`${baseUrl}/api/tasks/${encodeURIComponent(created.task.id)}`, {
         headers: { authorization: `Bearer ${authToken}` },

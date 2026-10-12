@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { CliAdapter } from "../server/adapters.mjs";
+import { networkTargetAllowed } from "../server/antigravity-containment.mjs";
 import { defaultConfig, discoverWorkBuddyCli, workBuddyCliCandidates, classifyMechanicalOutcome } from "../server/core.mjs";
 import { ControlPlane } from "../server/service.mjs";
 import {
@@ -24,6 +25,33 @@ test("discovers the bundled WorkBuddy CLI when it is installed outside PATH", ()
   const discovered = discoverWorkBuddyCli();
   assert.equal(discovered, bundled);
   assert.equal(defaultConfig().agents["tencent-workbuddy"].command, discovered);
+});
+
+test("permits the current WorkBuddy provider origin without granting task network access", () => {
+  const providerHosts = defaultConfig().agents["tencent-workbuddy"].permissionMapping.providerHosts;
+  const policy = { networkAllowed: false, providerHosts };
+  assert.equal(networkTargetAllowed("www.workbuddy.cn", policy), true);
+  assert.equal(networkTargetAllowed("copilot.tencent.com", policy), true);
+  assert.equal(networkTargetAllowed("example.com", policy), false);
+  assert.equal(networkTargetAllowed("www.workbuddy.cn.example.com", policy), false);
+  assert.equal(networkTargetAllowed("127.0.0.1", policy), false);
+});
+
+test("marks WorkBuddy permission profiles unverified when the observed CLI version drifts", async () => {
+  const config = defaultConfig().agents["tencent-workbuddy"];
+  const adapter = new CliAdapter("tencent-workbuddy", {
+    ...config,
+    command: process.execPath,
+    versionArgs: ["-e", "process.stdout.write('codebuddy 2.156.0')"],
+  });
+  const health = await adapter.health();
+  assert.equal(health.available, true);
+  assert.equal(health.observedProviderVersion, "2.156.0");
+  assert.equal(health.providerVersionValidation.status, "version_mismatch");
+  assert.equal(health.providerVersionValidation.validatedProviderVersion, "2.106.4");
+  for (const profile of Object.values(health.capabilityReport.executionProfiles)) {
+    assert.notEqual(profile.status, "SUPPORTED");
+  }
 });
 
 test("appends a requested model and uses the WorkBuddy resume template", async () => {

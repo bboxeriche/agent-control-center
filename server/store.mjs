@@ -270,6 +270,7 @@ export class Store {
       errorText: "error_text",
       prompt: "prompt",
       attemptNo: "attempt_no",
+      timeoutMs: "timeout_ms",
       metadata: "metadata_json",
     };
     const assignments = [];
@@ -301,6 +302,83 @@ export class Store {
   listTasks(limit = 50) {
     const rows = this.db.prepare("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?").all(Math.min(Math.max(Number(limit) || 50, 1), 200));
     return rows.map(mapTask);
+  }
+
+  listTaskSummaryPage({ limit = 30, cursor = null, agent = null, status = null, query = "" } = {}) {
+    const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 100);
+    const filterClauses = [];
+    const filterParams = [];
+    if (agent) {
+      filterClauses.push("agent = ?");
+      filterParams.push(agent);
+    }
+    if (status) {
+      filterClauses.push("status = ?");
+      filterParams.push(status);
+    }
+    if (query) {
+      filterClauses.push("instr(lower(prompt), lower(?)) > 0");
+      filterParams.push(query);
+    }
+    const filterWhere = filterClauses.length ? ` WHERE ${filterClauses.join(" AND ")}` : "";
+    const countRow = this.db.prepare(`SELECT COUNT(*) AS count FROM tasks${filterWhere}`).get(...filterParams);
+    const pageClauses = [...filterClauses];
+    const pageParams = [...filterParams];
+    if (cursor) {
+      const anchor = this.db.prepare("SELECT created_at, id FROM tasks WHERE id = ?").get(cursor);
+      if (!anchor) throw new Error("task page cursor is invalid");
+      pageClauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
+      pageParams.push(anchor.created_at, anchor.created_at, anchor.id);
+    }
+    const pageWhere = pageClauses.length ? ` WHERE ${pageClauses.join(" AND ")}` : "";
+    const rows = this.db.prepare(`
+      SELECT id, agent, prompt, cwd, status, created_at, started_at, finished_at, timeout_ms,
+        provider_session_id, attempt_no, result_text, error_text
+      FROM tasks${pageWhere}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(...pageParams, safeLimit + 1);
+    const hasMore = rows.length > safeLimit;
+    if (hasMore) rows.pop();
+    const tasks = rows.map((row) => ({
+      id: row.id,
+      agent: row.agent,
+      prompt: truncate(redactSecrets(row.prompt), 180),
+      cwd: row.cwd,
+      status: row.status,
+      createdAt: row.created_at,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      hasProviderSessionId: Boolean(row.provider_session_id),
+      timeoutMs: row.timeout_ms,
+      attemptNo: row.attempt_no ?? 1,
+      resultPreview: truncate(redactSecrets(row.error_text || row.result_text || ""), 240),
+      resultPreviewKind: row.error_text ? "error" : row.result_text ? "provider_output" : "none",
+    }));
+    const total = Number(countRow?.count || 0);
+    const statusCounts = Object.fromEntries(this.db.prepare("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").all().map((row) => [row.status, Number(row.count)]));
+    return { tasks, hasMore, nextCursor: hasMore ? tasks.at(-1)?.id || null : null, total, statusCounts };
+  }
+
+  latestTaskExecutionForAgent(agent) {
+    const row = this.db.prepare(`
+      SELECT id, status, created_at, started_at, finished_at, exit_code, error_text, model, metadata_json
+      FROM tasks WHERE agent = ? ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(agent);
+    if (!row) return null;
+    const metadata = parseJson(row.metadata_json, {});
+    return {
+      taskId: row.id,
+      status: row.status,
+      createdAt: row.created_at,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      exitCode: row.exit_code,
+      errorText: row.error_text,
+      mechanicalOutcome: metadata.mechanicalOutcome?.outcome || null,
+      providerModel: metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || row.model || null,
+      permissionCleanup: metadata.permissionCleanup?.state || null,
+    };
   }
 
   addEvent(input) {

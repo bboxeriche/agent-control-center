@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
-import { DEFAULT_HOST, DEFAULT_PORT, loadConfig, readAuthToken, resolveDataDir } from "./core.mjs";
+import { DEFAULT_HOST, DEFAULT_PORT, MAX_TASK_TIMEOUT_MS, loadConfig, readAuthToken, resolveDataDir } from "./core.mjs";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const servicePath = fileURLToPath(new URL("./service.mjs", import.meta.url));
@@ -36,7 +36,7 @@ export const DEVSPACE_TOOLS = [
         prompt: { type: "string", minLength: 1 },
         cwd: { type: "string", description: "Absolute repository working directory inside ACC allowed roots." },
         model: { type: "string" },
-        timeoutMs: { type: "integer", minimum: 1000 },
+        timeoutMs: { type: "integer", minimum: 1000, maximum: MAX_TASK_TIMEOUT_MS, description: "Per-attempt budget; omit to use the service default (60 minutes unless configured otherwise). Explicit shorter budgets are preserved." },
         originRequestId: { type: "string" },
         idempotencyKey: { type: "string", description: "Stable key for retrying this exact create request." },
         permissionPolicy: { type: "object", additionalProperties: false },
@@ -49,7 +49,7 @@ export const DEVSPACE_TOOLS = [
   { name: "acc_task_get", description: "Get one durable task by taskId.", inputSchema: { type: "object", required: ["taskId"], properties: { taskId: { type: "string" } }, additionalProperties: false } },
   { name: "acc_task_wait", description: "Wait for a bounded task update and return durable events.", inputSchema: { type: "object", required: ["taskId"], properties: { taskId: { type: "string" }, timeoutMs: { type: "integer", minimum: 1000, maximum: 60000 }, afterCursor: { type: "integer", minimum: 0 } }, additionalProperties: false } },
   { name: "acc_task_events", description: "Read durable task events after a cursor.", inputSchema: { type: "object", required: ["taskId"], properties: { taskId: { type: "string" }, afterCursor: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 1000 } }, additionalProperties: false } },
-  { name: "acc_task_reply", description: "Send a follow-up while preserving the same durable taskId.", inputSchema: { type: "object", required: ["taskId", "prompt"], properties: { taskId: { type: "string" }, prompt: { type: "string", minLength: 1 }, originRequestId: { type: "string" }, idempotencyKey: { type: "string" } }, additionalProperties: false } },
+  { name: "acc_task_reply", description: "Send a follow-up while preserving the same durable taskId; a completed task's next attempt can use a new timeoutMs budget.", inputSchema: { type: "object", required: ["taskId", "prompt"], properties: { taskId: { type: "string" }, prompt: { type: "string", minLength: 1 }, timeoutMs: { type: "integer", minimum: 1000, maximum: MAX_TASK_TIMEOUT_MS }, originRequestId: { type: "string" }, idempotencyKey: { type: "string" } }, additionalProperties: false } },
   { name: "acc_task_stop", description: "Stop a queued or running task.", inputSchema: { type: "object", required: ["taskId"], properties: { taskId: { type: "string" } }, additionalProperties: false } },
   {
     name: "acc_discussion_create",
@@ -175,7 +175,7 @@ export function createDevSpaceClient({
       }
       case "acc_task_reply": {
         const { origin, ...body } = args;
-        return api(`/api/tasks/${encodeURIComponent(args.taskId)}/reply`, { method: "POST", body: { prompt: body.prompt }, originRequestId: args.originRequestId, idempotencyKey: args.idempotencyKey });
+        return api(`/api/tasks/${encodeURIComponent(args.taskId)}/reply`, { method: "POST", body: { prompt: body.prompt, timeoutMs: body.timeoutMs }, originRequestId: args.originRequestId, idempotencyKey: args.idempotencyKey });
       }
       case "acc_task_stop":
         return api(`/api/tasks/${encodeURIComponent(args.taskId)}/stop`, { method: "POST", body: {}, originRequestId: args.originRequestId });

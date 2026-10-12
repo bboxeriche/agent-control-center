@@ -18,6 +18,7 @@ async function waitForTask(plane, id) {
 
 test("uses the WorkBuddy HTTP jobs and SSE contract when configured", async () => {
   let jobId = "job-001";
+  let healthStatus = 200;
   const requests = [];
   const provider = createServer((request, response) => {
     requests.push({ method: request.method, url: request.url, headers: request.headers });
@@ -32,7 +33,7 @@ test("uses the WorkBuddy HTTP jobs and SSE contract when configured", async () =
       return;
     }
     if (request.method === "GET" && request.url === "/api/v1/health") {
-      response.writeHead(200, { "content-type": "application/json" });
+      response.writeHead(healthStatus, { "content-type": "application/json" });
       response.end(JSON.stringify({ status: "ok" }));
       return;
     }
@@ -50,14 +51,30 @@ test("uses the WorkBuddy HTTP jobs and SSE contract when configured", async () =
   const address = provider.address();
   const config = defaultConfig();
   config.defaultTimeoutMs = 5000;
-  config.agents["tencent-workbuddy"] = { ...config.agents["tencent-workbuddy"], httpUrl: `http://127.0.0.1:${address.port}` };
+  config.agents = {
+    "tencent-workbuddy": { ...config.agents["tencent-workbuddy"], httpUrl: `http://127.0.0.1:${address.port}` },
+  };
   const plane = new ControlPlane({ dataDir: await mkdtemp(join(tmpdir(), "acc-workbuddy-")), config });
   try {
+    const healthyAgent = (await plane.agentHealth())[0];
+    assert.equal(healthyAgent.authentication, "not_rejected_by_health_endpoint");
+    assert.ok(healthyAgent.healthCheckedAt);
+    assert.equal(healthyAgent.recentExecution, null);
+    healthStatus = 401;
+    const rejectedAgent = (await plane.agentHealth())[0];
+    assert.equal(rejectedAgent.authentication, "rejected");
+    assert.equal(rejectedAgent.statusCode, 401);
+    healthStatus = 200;
+
     const task = plane.createTask({ agent: "tencent-workbuddy", prompt: "review the adapter", cwd: process.cwd() });
     const finished = await waitForTask(plane, task.id);
     assert.equal(finished.status, "succeeded");
     assert.equal(finished.providerSessionId, "wb-session-001");
     assert.match(finished.resultText, /configured HTTP adapter/);
+    const healthAfterTask = (await plane.agentHealth())[0];
+    assert.equal(healthAfterTask.recentExecution.taskId, task.id);
+    assert.equal(healthAfterTask.recentExecution.mechanicalOutcome, "succeeded");
+    assert.ok(healthAfterTask.recentExecution.providerModel);
     assert.ok(requests.length >= 2);
     assert.ok(requests.every((item) => item.headers["x-codebuddy-request"] === "1"));
   } finally {

@@ -17,6 +17,7 @@ import {
 import {
   DEFAULT_HOST,
   DEFAULT_PORT,
+  MAX_TASK_TIMEOUT_MS,
   SERVICE_VERSION,
   buildPermissionPolicy,
   capabilitiesFor,
@@ -85,6 +86,47 @@ function statusError(status, message) {
   return error;
 }
 
+function applyWorkBuddyVersionEvidence(capabilityReport, executionProfile, validation) {
+  const sourceEvidence = validation || {
+    status: "not_checked",
+    validatedProviderVersion: capabilityReport.providerVersion,
+    observedProviderVersion: null,
+  };
+  const versionReason = sourceEvidence.status === "version_match"
+    ? null
+    : sourceEvidence.status === "not_checked"
+      ? "WorkBuddy CLI version has not been verified recently; configured permission profiles are shown as unverified."
+      : sourceEvidence.status === "version_mismatch"
+        ? `Installed WorkBuddy CLI ${sourceEvidence.observedProviderVersion || "unknown"} differs from validated ${sourceEvidence.validatedProviderVersion || "unknown"}; configured permission profiles are shown as unverified.`
+        : `WorkBuddy CLI version validation is ${sourceEvidence.status}; configured permission profiles are shown as unverified.`;
+  const versionEvidence = { ...sourceEvidence, reason: versionReason };
+  const apply = (profile) => ({
+    ...profile,
+    providerVersionValidation: versionEvidence,
+    ...(profile.status === "SUPPORTED" && versionEvidence.status !== "version_match"
+      ? {
+        status: "UNVERIFIED",
+        configuredStatus: profile.status,
+        code: "workbuddy_provider_version_unverified",
+        reason: [profile.reason, versionReason].filter(Boolean).join("; "),
+      }
+      : {}),
+  });
+  const report = {
+    ...capabilityReport,
+    providerVersionValidation: versionEvidence,
+    executionProfiles: Object.fromEntries(Object.entries(capabilityReport.executionProfiles || {}).map(([key, profile]) => [key, apply(profile)])),
+  };
+  return { capabilityReport: report, executionProfile: executionProfile ? apply(executionProfile) : executionProfile };
+}
+
+function cachedProviderVersionValidation(cache, agent) {
+  const health = cache.get(agent);
+  const checkedAt = Date.parse(health?.healthCheckedAt || "");
+  if (!Number.isFinite(checkedAt) || Date.now() - checkedAt > 5 * 60 * 1000) return null;
+  return health.providerVersionValidation || null;
+}
+
 function discussionAgentNames(config, requested) {
   const names = requested?.length ? requested : Object.keys(config.agents);
   const unique = [...new Set(names.map((name) => String(name)))];
@@ -111,12 +153,82 @@ function safeResultText(runtime, result) {
   return truncate(redactSecrets(result?.stdout || ""), 60000);
 }
 
+function recognizedFinalAnswer(agent, value) {
+  let text = "";
+  let eventType = "";
+  if (value?.type === "result" && typeof value.result === "string" && value.result.trim()) {
+    text = value.result;
+    eventType = "result";
+  } else if (agent === "antigravity" && value?.event === "result" && value.result?.status === "SUCCESS" && typeof value.result.response === "string") {
+    text = value.result.response;
+    eventType = "result/response";
+  } else if (agent === "codex-cli" && value?.type === "item.completed" && value.item?.type === "agent_message" && typeof value.item.text === "string") {
+    text = value.item.text;
+    eventType = "item.completed/agent_message";
+  }
+  return text.trim() ? { source: "provider_final_event", eventType, text: truncate(redactSecrets(text.trim()), 60000) } : null;
+}
+
+function taskResultSummary(task) {
+  const metadata = task.metadata || {};
+  const policy = task.permissionPolicy || {};
+  const effective = policy.effective || {};
+  const profile = policy.executionProfile || {};
+  const finalAnswer = metadata.providerFinalAnswer;
+  const answerText = typeof finalAnswer?.text === "string" ? finalAnswer.text : "";
+  const limitations = [...(Array.isArray(policy.limitations) ? policy.limitations : []), ...(profile.reason ? [profile.reason] : [])];
+  return {
+    taskId: task.id,
+    status: task.status,
+    mechanicalOutcome: metadata.mechanicalOutcome ? {
+      outcome: metadata.mechanicalOutcome.outcome || "unknown",
+      code: metadata.mechanicalOutcome.code || null,
+      reason: metadata.mechanicalOutcome.reason ? truncate(redactSecrets(metadata.mechanicalOutcome.reason), 1200) : null,
+    } : { outcome: "not_recorded", code: null, reason: null },
+    providerFinalAnswerEvidence: answerText ? {
+      source: finalAnswer.source || "provider_final_event",
+      eventType: finalAnswer.eventType || null,
+      preview: truncate(answerText, 1200),
+      truncated: answerText.length > 1200,
+      semanticVerification: "not_performed",
+    } : null,
+    providerOutputAvailable: Boolean(task.resultText),
+    providerModel: metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || task.model || null,
+    errors: {
+      controlPlane: task.errorText ? truncate(redactSecrets(task.errorText), 4000) : null,
+      providerStructured: metadata.providerFacts?.structuredToolErrors || [],
+    },
+    permission: {
+      origin: task.origin || "local_cli",
+      effective: {
+        workspace: effective.workspace || task.cwd,
+        filesystemScope: effective.filesystemScope || [],
+        writeAllowed: effective.writeAllowed ?? null,
+        networkAllowed: effective.networkAllowed ?? null,
+        approvalPolicy: effective.approvalPolicy || null,
+      },
+      executionProfile: {
+        status: profile.status || policy.status || "unknown",
+        code: profile.code || null,
+        mechanism: profile.mechanism || null,
+        providerVersionValidation: profile.providerVersionValidation || policy.capabilityReport?.providerVersionValidation || null,
+      },
+      limitations,
+    },
+    permissionCleanup: metadata.permissionCleanup ? {
+      state: metadata.permissionCleanup.state || "unknown",
+      error: metadata.permissionCleanup.error ? truncate(redactSecrets(metadata.permissionCleanup.error), 800) : null,
+    } : null,
+  };
+}
+
 export class ControlPlane {
   constructor({ dataDir = resolveDataDir(), config = null } = {}) {
     this.dataDir = ensureDir(dataDir);
     this.authToken = ensureAuthToken(this.dataDir);
     this.store = new Store(this.dataDir);
     this.config = config || loadConfig(this.dataDir).config;
+    this.providerHealthCache = new Map();
     this.hub = new EventHub();
     this.runtime = new Map();
     this.runningPromises = new Map();
@@ -148,7 +260,7 @@ export class ControlPlane {
       enforceAllowedRoot: origin === "devspace" || origin === "dashboard",
       rejectTraversal: origin === "devspace" || origin === "dashboard",
     });
-    const timeoutMs = clamp(input.timeoutMs, 1000, 4 * 60 * 60 * 1000, this.config.defaultTimeoutMs);
+    const timeoutMs = clamp(input.timeoutMs ?? this.config.defaultTimeoutMs, 1000, MAX_TASK_TIMEOUT_MS, this.config.defaultTimeoutMs);
     const model = input.model === undefined || input.model === null || String(input.model).trim() === ""
       ? agentConfig.defaultModel || null
       : String(input.model).trim();
@@ -208,9 +320,13 @@ export class ControlPlane {
           providerHosts: mapping.providerHosts,
           containedTools: mapping.containedTools,
         });
-      permissionPolicy.capabilityReport = capabilityReport;
-      permissionPolicy.executionProfile = executionProfile;
-      permissionPolicy.effectiveEnforcement = capabilityReport.effectiveEnforcement;
+      const validation = agentConfig.httpUrl?.trim()
+        ? { status: "not_applicable", validatedProviderVersion: capabilityReport.providerVersion, observedProviderVersion: null }
+        : cachedProviderVersionValidation(this.providerHealthCache, input.agent);
+      const versionAware = applyWorkBuddyVersionEvidence(capabilityReport, executionProfile, validation);
+      permissionPolicy.capabilityReport = versionAware.capabilityReport;
+      permissionPolicy.executionProfile = versionAware.executionProfile;
+      permissionPolicy.effectiveEnforcement = versionAware.capabilityReport.effectiveEnforcement;
     }
     const requestFingerprint = idempotencyFingerprint({
       agent: input.agent,
@@ -320,6 +436,7 @@ export class ControlPlane {
     if (!task) return;
     const runtime = {
       textParts: [],
+      providerFinalAnswer: null,
       handle: null,
       stopRequested: false,
       timedOut: false,
@@ -363,6 +480,8 @@ export class ControlPlane {
           this.store.updateTask(taskId, { providerSessionId: sessionId });
         }
         if (event.text && !["provider_error", "stderr"].includes(event.type)) runtime.textParts.push(event.text);
+        const finalAnswer = recognizedFinalAnswer(task.agent, event.payload?.json);
+        if (finalAnswer) runtime.providerFinalAnswer = finalAnswer;
         this.emit({
           taskId,
           eventType: event.type || "provider_message",
@@ -461,6 +580,7 @@ export class ControlPlane {
       ...task.metadata,
       mechanicalOutcome,
       providerFacts,
+      providerFinalAnswer: runtime.providerFinalAnswer,
       permissionCleanup: result?.permissionCleanup || null,
     };
     if (task.agent === "tencent-workbuddy") {
@@ -512,6 +632,74 @@ export class ControlPlane {
 
   listTasks(limit) {
     return this.store.listTasks(limit);
+  }
+
+  listTaskSummaryPage({ limit, cursor, agent, status, query } = {}) {
+    const normalizedAgent = String(agent || "").trim();
+    if (normalizedAgent && !this.config.agents[normalizedAgent]) throw statusError(400, "unknown agent filter");
+    const normalizedStatus = String(status || "").trim();
+    const allowedStatuses = new Set(["queued", "running", "succeeded", "failed", "stopped", "timed_out", "interrupted", "completed_with_errors"]);
+    if (normalizedStatus && !allowedStatuses.has(normalizedStatus)) throw statusError(400, "invalid task status filter");
+    const normalizedCursor = String(cursor || "").trim();
+    if (normalizedCursor.length > 200) throw statusError(400, "invalid task page cursor");
+    return this.store.listTaskSummaryPage({
+      limit,
+      cursor: normalizedCursor || null,
+      agent: normalizedAgent || null,
+      status: normalizedStatus || null,
+      query: String(query || "").trim().slice(0, 120),
+    });
+  }
+
+  previewTaskPolicy(input = {}) {
+    const agent = String(input.agent || "").trim();
+    const agentConfig = this.config.agents[agent];
+    if (!agentConfig) throw statusError(400, `unknown agent: ${agent}`);
+    const cwd = validateCwd(input.cwd || this.config.defaultCwd || process.env.AGENT_CONTROL_DEFAULT_CWD, {
+      allowedRoots: this.config.allowedRoots,
+      enforceAllowedRoot: true,
+      rejectTraversal: true,
+    });
+    const capabilities = capabilitiesFor(agent, this.config);
+    const permissionPolicy = buildPermissionPolicy({
+      cwd,
+      origin: "dashboard",
+      requested: {},
+      capabilities,
+      allowedRoots: this.config.allowedRoots,
+      originCapabilityCeiling: this.config.originCapabilityCeilings?.dashboard || {},
+    });
+    if (agent === "antigravity") {
+      const mapping = agentConfig.permissionMapping || {};
+      const capabilityReport = antigravityCapabilityReport(mapping);
+      const executionProfile = preflightAntigravityExecutionProfile(permissionPolicy, {
+        strategy: mapping.strategy,
+        sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+      });
+      permissionPolicy.capabilityReport = capabilityReport;
+      permissionPolicy.executionProfile = executionProfile;
+      permissionPolicy.effectiveEnforcement = capabilityReport.effectiveEnforcement;
+    } else if (agent === "tencent-workbuddy") {
+      const mapping = agentConfig.permissionMapping || {};
+      const capabilityReport = workBuddyCapabilityReport(agentConfig, { http: Boolean(agentConfig.httpUrl?.trim()) });
+      const executionProfile = agentConfig.httpUrl?.trim()
+        ? { profile: null, status: "UNSUPPORTED", code: "workbuddy_http_endpoint_unqualified", mechanism: "http-endpoint-unqualified", reason: "a remote WorkBuddy HTTP endpoint is outside this local process containment boundary" }
+        : preflightWorkBuddyExecutionProfile(permissionPolicy, {
+          strategy: mapping.strategy || WORKBUDDY_CONTAINMENT_STRATEGY,
+          sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+          nativePermissionMode: mapping.nativePermissionMode,
+          providerHosts: mapping.providerHosts,
+          containedTools: mapping.containedTools,
+        });
+      const validation = agentConfig.httpUrl?.trim()
+        ? { status: "not_applicable", validatedProviderVersion: capabilityReport.providerVersion, observedProviderVersion: null }
+        : cachedProviderVersionValidation(this.providerHealthCache, agent);
+      const versionAware = applyWorkBuddyVersionEvidence(capabilityReport, executionProfile, validation);
+      permissionPolicy.capabilityReport = versionAware.capabilityReport;
+      permissionPolicy.executionProfile = versionAware.executionProfile;
+      permissionPolicy.effectiveEnforcement = versionAware.capabilityReport.effectiveEnforcement;
+    }
+    return { agent, label: agentConfig.label || agent, origin: "dashboard", cwd, capabilities, permissionPolicy };
   }
 
   listTaskEvents(id, after) {
@@ -575,6 +763,9 @@ export class ControlPlane {
     const actionRequestId = normalizeOptionalIdentifier(options.originRequestId, "originRequestId");
     const runtime = this.runtime.get(id);
     if (!taskIsTerminal(task) && runtime?.handle?.reply) {
+      if (options.timeoutMs !== undefined && Number(options.timeoutMs) !== task.timeoutMs) {
+        throw statusError(409, "a running attempt's timeout cannot be changed; set timeoutMs on the next attempt");
+      }
       const response = await runtime.handle.reply(value);
       this.emit({
         taskId: id,
@@ -611,12 +802,17 @@ export class ControlPlane {
       providerJobId: null,
       prompt: value,
       attemptNo: nextAttemptNo,
+      timeoutMs: clamp(options.timeoutMs ?? task.timeoutMs, 1000, MAX_TASK_TIMEOUT_MS, task.timeoutMs),
       metadata: {
         ...task.metadata,
         replyTo: task.id,
         resumed: Boolean(task.providerSessionId),
         lastReplyOrigin: actionOrigin,
         lastReplyOriginRequestId: actionRequestId,
+        mechanicalOutcome: null,
+        providerFacts: null,
+        providerFinalAnswer: null,
+        permissionCleanup: null,
       },
     });
     this.emit({
@@ -626,6 +822,7 @@ export class ControlPlane {
       payload: {
         taskId: id,
         attemptNo: nextAttemptNo,
+        timeoutMs: resumed.timeoutMs,
         providerSessionId: task.providerSessionId,
         providerResumeSupported: capabilitiesFor(task.agent, this.config).resume,
         origin: actionOrigin,
@@ -637,9 +834,36 @@ export class ControlPlane {
     return this.getTask(resumed.id);
   }
 
-  async agentHealth() {
-    const entries = await Promise.all(Object.keys(this.config.agents).map((agent) => healthFor(agent, this.config)));
-    return entries;
+  async agentHealth({ probe = true } = {}) {
+    const entries = await Promise.all(Object.keys(this.config.agents).map(async (agent) => {
+      const cached = this.providerHealthCache.get(agent);
+      if (!probe && cached) return cached;
+      const entry = await healthFor(agent, this.config);
+      const checkedAt = nowIso();
+      return {
+        ...entry,
+        healthCheckedAt: checkedAt,
+        ...(entry.providerVersionValidation ? { providerVersionValidation: { ...entry.providerVersionValidation, checkedAt } } : {}),
+      };
+    }));
+    const enriched = entries.map((entry) => {
+      const recent = this.store.latestTaskExecutionForAgent(entry.agent);
+      const authentication = entry.kind === "http" && [401, 403].includes(Number(entry.statusCode))
+        ? "rejected"
+        : entry.kind === "http" && Number(entry.statusCode) >= 200 && Number(entry.statusCode) < 300
+          ? "not_rejected_by_health_endpoint"
+          : "not_verified";
+      return {
+        ...entry,
+        authentication,
+        recentExecution: recent ? {
+          ...recent,
+          errorText: recent.errorText ? truncate(redactSecrets(recent.errorText), 400) : null,
+        } : null,
+      };
+    });
+    for (const entry of enriched) this.providerHealthCache.set(entry.agent, entry);
+    return enriched;
   }
 
   createDiscussion(input) {
@@ -967,6 +1191,7 @@ export class ControlPlane {
     }));
     await Promise.allSettled([...this.runningPromises.values()]);
     await Promise.allSettled([...this.discussionPromises.values()]);
+    this.hub.publish({ eventType: "service_closing" });
     this.store.close();
   }
 }
@@ -1002,12 +1227,19 @@ async function readJsonBody(request, maxBytes = 2_000_000) {
   }
 }
 
-function requestMetadata(request) {
+function requestMetadata(request, { dashboardSession = false } = {}) {
   return {
-    origin: request.headers["x-agent-control-origin"],
+    origin: dashboardSession ? "dashboard" : request.headers["x-agent-control-origin"],
     originRequestId: request.headers["x-agent-control-request-id"],
     idempotencyKey: request.headers["idempotency-key"],
   };
+}
+
+function requestInput(request, body, options = {}) {
+  const metadata = requestMetadata(request, options);
+  const input = { ...metadata, ...body };
+  if (typeof metadata.origin === "string" && metadata.origin.trim()) input.origin = metadata.origin;
+  return input;
 }
 
 function eventMatches(event, scope, id) {
@@ -1028,10 +1260,38 @@ function streamEvents(request, response, plane, scope, id, after) {
   response.write("retry: 2000\n\n");
   for (const event of initial) writeSse(response, event);
   const unsubscribe = plane.hub.subscribe((event) => {
+    if (event.eventType === "service_closing") { response.end(); return; }
     if (eventMatches(event, scope, id)) writeSse(response, event);
   });
   const keepAlive = setInterval(() => response.write(": keep-alive\n\n"), 15000);
-  request.on("close", () => {
+  response.on("close", () => {
+    clearInterval(keepAlive);
+    unsubscribe();
+  });
+}
+
+const DASHBOARD_ACTIVITY_EVENTS = new Set([
+  "task_created", "task_started", "task_finished", "task_resumed", "stop_requested",
+  "discussion_created", "discussion_started", "discussion_round_finished", "discussion_finished",
+  "minutes_generated", "minutes_error",
+]);
+
+function streamDashboardActivity(request, response, plane) {
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+  });
+  // This stream invalidates Dashboard snapshots, not an additional durable
+  // event log. On every connect/reconnect the client reloads authoritative data.
+  const unsubscribe = plane.hub.subscribe((event) => {
+    if (event.eventType === "service_closing") { response.end(); return; }
+    if (!DASHBOARD_ACTIVITY_EVENTS.has(event.eventType)) return;
+    response.write(`event: activity\ndata: ${JSON.stringify({ eventType: event.eventType, taskId: event.taskId, discussionId: event.discussionId })}\n\n`);
+  });
+  response.write("retry: 2000\nevent: ready\ndata: {}\n\n");
+  const keepAlive = setInterval(() => response.write(": keep-alive\n\n"), 15000);
+  response.on("close", () => {
     clearInterval(keepAlive);
     unsubscribe();
   });
@@ -1091,20 +1351,42 @@ export function createRequestHandler(plane) {
       let decodedCookieToken = "";
       try { decodedCookieToken = decodeURIComponent(cookieToken); } catch { /* Treat malformed cookies as unauthenticated. */ }
       if (bearer !== plane.authToken && decodedCookieToken !== plane.authToken) return jsonResponse(response, 401, { error: "authentication required" });
-      if (request.method === "GET" && path === "/api/agents") return jsonResponse(response, 200, { agents: await plane.agentHealth() });
+      const dashboardSession = Boolean(origin && decodedCookieToken === plane.authToken);
+      if (request.method === "GET" && path === "/api/agents") return jsonResponse(response, 200, {
+        agents: await plane.agentHealth({ probe: url.searchParams.get("cached") !== "1" }),
+        taskOptions: { defaultTimeoutMs: plane.config.defaultTimeoutMs, maxTimeoutMs: MAX_TASK_TIMEOUT_MS },
+      });
+      if (request.method === "GET" && path === "/api/activity/stream") return streamDashboardActivity(request, response, plane);
+      if (request.method === "GET" && path === "/api/task-summaries") {
+        return jsonResponse(response, 200, plane.listTaskSummaryPage({
+          limit: url.searchParams.get("limit"),
+          cursor: url.searchParams.get("cursor"),
+          agent: url.searchParams.get("agent"),
+          status: url.searchParams.get("status"),
+          query: url.searchParams.get("query"),
+        }));
+      }
+      if (request.method === "GET" && path === "/api/policy-preview") {
+        return jsonResponse(response, 200, plane.previewTaskPolicy({ agent: url.searchParams.get("agent"), cwd: url.searchParams.get("cwd") }));
+      }
       if (request.method === "GET" && path === "/api/tasks") return jsonResponse(response, 200, { tasks: plane.listTasks(url.searchParams.get("limit")) });
       if (request.method === "POST" && path === "/api/tasks") {
-        const outcome = plane.createTaskRequest({ ...requestMetadata(request), ...(await readJsonBody(request)) });
-        return jsonResponse(response, 202, outcome);
+        const outcome = plane.createTaskRequest(requestInput(request, await readJsonBody(request), { dashboardSession }));
+        return jsonResponse(response, 202, { ...outcome, resultSummary: taskResultSummary(outcome.task) });
       }
       if (request.method === "GET" && path === "/api/discussions") return jsonResponse(response, 200, { discussions: plane.listDiscussions(url.searchParams.get("limit")) });
-      if (request.method === "POST" && path === "/api/discussions") return jsonResponse(response, 202, { discussion: plane.createDiscussion(await readJsonBody(request)) });
+      if (request.method === "POST" && path === "/api/discussions") {
+        return jsonResponse(response, 202, { discussion: plane.createDiscussion(requestInput(request, await readJsonBody(request), { dashboardSession })) });
+      }
 
       const taskMatch = path.match(/^\/api\/tasks\/([^/]+)(?:\/(events|wait|stream|stop|reply))?$/);
       if (taskMatch) {
         const id = decodeURIComponent(taskMatch[1]);
         const action = taskMatch[2];
-        if (request.method === "GET" && !action) return jsonResponse(response, 200, { task: plane.getTask(id) });
+        if (request.method === "GET" && !action) {
+          const task = plane.getTask(id);
+          return jsonResponse(response, 200, { task, resultSummary: taskResultSummary(task) });
+        }
         if (request.method === "GET" && action === "events") {
           const afterCursor = url.searchParams.has("afterCursor") ? url.searchParams.get("afterCursor") : url.searchParams.get("after");
           return jsonResponse(response, 200, plane.listTaskEventPage(id, afterCursor, url.searchParams.get("limit")));
@@ -1112,16 +1394,21 @@ export function createRequestHandler(plane) {
         if (request.method === "GET" && action === "wait") {
           const afterCursor = url.searchParams.has("afterCursor") ? url.searchParams.get("afterCursor") : undefined;
           const timeoutMs = url.searchParams.has("timeoutMs") ? url.searchParams.get("timeoutMs") : url.searchParams.get("timeout");
-          return jsonResponse(response, 200, await plane.waitTask(id, timeoutMs, afterCursor));
+          const outcome = await plane.waitTask(id, timeoutMs, afterCursor);
+          return jsonResponse(response, 200, { ...outcome, resultSummary: taskResultSummary(outcome.task) });
         }
         if (request.method === "GET" && action === "stream") {
           const afterCursor = url.searchParams.has("afterCursor") ? url.searchParams.get("afterCursor") : url.searchParams.get("after");
           return streamEvents(request, response, plane, "task", id, afterCursor);
         }
-        if (request.method === "POST" && action === "stop") return jsonResponse(response, 200, { task: await plane.stopTask(id) });
+        if (request.method === "POST" && action === "stop") {
+          const task = await plane.stopTask(id);
+          return jsonResponse(response, 200, { task, resultSummary: taskResultSummary(task) });
+        }
         if (request.method === "POST" && action === "reply") {
-          const body = { ...requestMetadata(request), ...(await readJsonBody(request)) };
-          return jsonResponse(response, 202, { task: await plane.replyTask(id, body.prompt, body) });
+          const body = requestInput(request, await readJsonBody(request), { dashboardSession });
+          const task = await plane.replyTask(id, body.prompt, body);
+          return jsonResponse(response, 202, { task, resultSummary: taskResultSummary(task) });
         }
       }
 

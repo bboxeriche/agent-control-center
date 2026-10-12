@@ -1,9 +1,40 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CliAdapter } from "../server/adapters.mjs";
 import { codexCliCandidates, defaultConfig, discoverCodexCli, extractSessionId, extractText } from "../server/core.mjs";
+
+test("discovers current and legacy desktop layouts without depending on a shell PATH", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acc-codex-discovery-"));
+  try {
+    const candidates = codexCliCandidates({ platform: "darwin", appRoots: [root] });
+    const native = join(root, "ChatGPT.app", "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex");
+    const launcher = join(root, "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin", "codex");
+    const legacy = join(root, "ChatGPT.app", "Contents", "Resources", "codex");
+    const codexApp = join(root, "Codex.app", "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex");
+    assert.deepEqual(candidates.slice(0, 3), [native, launcher, legacy]);
+    assert.ok(candidates.includes(codexApp));
+    assert.deepEqual(codexCliCandidates({ platform: "linux", appRoots: [root] }), []);
+    assert.equal(discoverCodexCli(candidates), "codex");
+
+    await mkdir(legacy, { recursive: true });
+    assert.equal(discoverCodexCli(candidates), "codex", "directories must not be accepted as CLI executables");
+    await rm(legacy, { recursive: true });
+    await writeFile(legacy, "legacy fixture");
+    assert.equal(discoverCodexCli(candidates), legacy);
+    await mkdir(join(root, "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin"), { recursive: true });
+    await writeFile(launcher, "launcher fixture");
+    assert.equal(discoverCodexCli(candidates), launcher);
+    await mkdir(join(root, "ChatGPT.app", "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS"), { recursive: true });
+    await writeFile(native, "native fixture");
+    assert.equal(discoverCodexCli(candidates), native, "prefer the current native bundle over legacy layouts");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("discovers the local Codex CLI and keeps the configured Luna Max default", () => {
   const bundled = codexCliCandidates().find((candidate) => existsSync(candidate)) || "codex";
@@ -52,6 +83,7 @@ test("maps an explicitly read-only policy to Codex's native sandbox on a new att
 test("extracts Codex thread and agent-message fields from JSONL events", () => {
   assert.equal(extractSessionId({ type: "thread.started", thread_id: "thread-123" }), "thread-123");
   assert.equal(extractText({ type: "item.completed", item: { type: "agent_message", text: "ACC_CODEX_E2E_OK" } }), "ACC_CODEX_E2E_OK");
+  assert.equal(extractText({ type: "item.completed", item: { type: "agent_message", content: [{ type: "text", text: "nested " }, { type: "text", text: "provider result" }] } }), "nested provider result");
 });
 
 test("treats a Codex error event as a provider failure", async () => {

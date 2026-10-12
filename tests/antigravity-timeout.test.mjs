@@ -33,10 +33,10 @@ test("maps long Antigravity task timeout to a deterministic print timeout below 
   const first = antigravityAdapter().start({ prompt: "long", cwd: process.cwd(), timeoutMs: 1_800_000 }, () => {});
   const second = antigravityAdapter().start({ prompt: "long", cwd: process.cwd(), timeoutMs: 1_800_000 }, () => {});
   const timeoutMs = timeoutFromArgs(first.args);
-  assert.equal(timeoutMs, 1_795_000);
+  assert.equal(timeoutMs, 1_740_000);
   assert.ok(timeoutMs > 5 * 60_000);
   assert.ok(timeoutMs < 1_800_000);
-  assert.equal(first.args[first.args.indexOf("--print-timeout") + 1], "29m55s");
+  assert.equal(first.args[first.args.indexOf("--print-timeout") + 1], "29m");
   assert.equal(timeoutFromArgs(second.args), timeoutMs, "same task timeout must map deterministically");
   await Promise.all([first.wait, second.wait]);
 });
@@ -44,7 +44,7 @@ test("maps long Antigravity task timeout to a deterministic print timeout below 
 test("different long task budgets produce different provider timeouts", async () => {
   const tenMinute = antigravityAdapter().start({ prompt: "ten", cwd: process.cwd(), timeoutMs: 600_000 }, () => {});
   const thirtyMinute = antigravityAdapter().start({ prompt: "thirty", cwd: process.cwd(), timeoutMs: 1_800_000 }, () => {});
-  assert.equal(tenMinute.args[tenMinute.args.indexOf("--print-timeout") + 1], "9m55s");
+  assert.equal(tenMinute.args[tenMinute.args.indexOf("--print-timeout") + 1], "9m30s");
   assert.notEqual(timeoutFromArgs(tenMinute.args), timeoutFromArgs(thirtyMinute.args));
   await Promise.all([tenMinute.wait, thirtyMinute.wait]);
 });
@@ -55,6 +55,12 @@ test("minimum ACC task timeout keeps a positive provider duration strictly below
   assert.equal(handle.args[handle.args.indexOf("--print-timeout") + 1], "500ms");
   assert.ok(providerTimeoutMs > 0);
   assert.ok(providerTimeoutMs < 1000);
+  await handle.wait;
+});
+
+test("an hour-long Antigravity attempt retains 59 minutes of provider time and a collection margin", async () => {
+  const handle = antigravityAdapter().start({ prompt: "one-hour budget", cwd: process.cwd(), timeoutMs: 3_600_000 }, () => {});
+  assert.equal(handle.args[handle.args.indexOf("--print-timeout") + 1], "59m");
   await handle.wait;
 });
 

@@ -20,7 +20,11 @@ test("DevSpace adapter injects local auth, fixed origin, request ID, and idempot
     ensureServiceImpl: async () => {},
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      return response(202, { task: { id: "task_devspace_001", origin: "devspace" }, reused: false });
+      return response(202, {
+        task: { id: "task_devspace_001", origin: "devspace" },
+        reused: false,
+        resultSummary: { taskId: "task_devspace_001", permission: { origin: "devspace" }, mechanicalOutcome: { outcome: "not_recorded" } },
+      });
     },
   });
   const payload = await client.call("acc_task_create", {
@@ -32,6 +36,8 @@ test("DevSpace adapter injects local auth, fixed origin, request ID, and idempot
     idempotencyKey: "leader-create-001",
   });
   assert.equal(payload.task.origin, "devspace");
+  assert.equal(payload.resultSummary.permission.origin, "devspace");
+  assert.equal(payload.resultSummary.mechanicalOutcome.outcome, "not_recorded");
   assert.equal(calls.length, 1);
   const call = calls[0];
   assert.equal(call.options.headers.authorization.startsWith("Bearer "), true);
@@ -40,6 +46,21 @@ test("DevSpace adapter injects local auth, fixed origin, request ID, and idempot
   assert.equal(call.options.headers["idempotency-key"], "leader-create-001");
   assert.equal(JSON.parse(call.options.body).origin, "devspace");
   assert.equal(JSON.stringify(payload).includes(call.options.headers.authorization.slice(7)), false);
+});
+
+test("DevSpace forwards next-attempt time budgets without widening the forced origin", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-devspace-budget-"));
+  ensureAuthToken(dataDir);
+  let sent;
+  const client = createDevSpaceClient({ dataDir, ensureServiceImpl: async () => {}, fetchImpl: async (_url, options) => {
+    sent = options;
+    return response(202, { task: { id: "task_budget_fixture" } });
+  } });
+  await client.call("acc_task_reply", { taskId: "task_budget_fixture", prompt: "next attempt", timeoutMs: 7_200_000, origin: "codex" });
+  assert.equal(JSON.parse(sent.body).timeoutMs, 7_200_000);
+  assert.equal(sent.headers["x-agent-control-origin"], "devspace");
+  const schema = DEVSPACE_TOOLS.find((tool) => tool.name === "acc_task_reply").inputSchema;
+  assert.equal(schema.properties.timeoutMs.maximum, 86_400_000);
 });
 
 test("DevSpace adapter exposes only the approved semantic tool surface", () => {

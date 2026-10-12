@@ -15,6 +15,8 @@ import {
 export const SERVICE_VERSION = "0.1.0";
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 47770;
+export const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1000;
+export const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 export const TERMINAL_TASK_STATUSES = new Set([
   "succeeded",
   "failed",
@@ -180,11 +182,11 @@ const WORKBUDDY_CLI_RELATIVE_PATH = join(
   "codebuddy",
 );
 
-const CODEX_CLI_RELATIVE_PATH = join(
-  "Contents",
-  "Resources",
-  "codex",
-);
+const CODEX_CLI_RELATIVE_PATHS = [
+  join("Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex"),
+  join("Contents", "Resources", "codex-cli", "bin", "codex"),
+  join("Contents", "Resources", "codex"),
+];
 
 export function workBuddyCliCandidates() {
   if (process.platform !== "darwin") return [];
@@ -205,16 +207,14 @@ export function discoverWorkBuddyCli() {
   return bundled || "codebuddy";
 }
 
-export function codexCliCandidates() {
-  if (process.platform !== "darwin") return [];
-  return [
-    join("/Applications", "ChatGPT.app", CODEX_CLI_RELATIVE_PATH),
-    join(homedir(), "Applications", "ChatGPT.app", CODEX_CLI_RELATIVE_PATH),
-  ];
+export function codexCliCandidates({ platform = process.platform, appRoots = ["/Applications", join(homedir(), "Applications")] } = {}) {
+  if (platform !== "darwin") return [];
+  return ["ChatGPT.app", "Codex.app"].flatMap((appName) => appRoots.flatMap((root) =>
+    CODEX_CLI_RELATIVE_PATHS.map((path) => join(root, appName, path))));
 }
 
-export function discoverCodexCli() {
-  const bundled = codexCliCandidates().find((candidate) => {
+export function discoverCodexCli(candidates = codexCliCandidates()) {
+  const bundled = candidates.find((candidate) => {
     try {
       return statSync(candidate).isFile();
     } catch {
@@ -549,7 +549,7 @@ export function defaultConfig() {
     defaultCwd: "",
     allowedRoots: [],
     maxConcurrentTasks: 4,
-    defaultTimeoutMs: 30 * 60 * 1000,
+    defaultTimeoutMs: DEFAULT_TASK_TIMEOUT_MS,
     maxWaitMs: 60 * 1000,
     maxPromptChars: 20000,
     maxDiscussionRounds: 3,
@@ -620,7 +620,7 @@ export function loadConfig(dataDir) {
     : [];
   config.port = positiveInteger(process.env.AGENT_CONTROL_PORT || config.port, DEFAULT_PORT);
   config.maxConcurrentTasks = positiveInteger(config.maxConcurrentTasks, 4);
-  config.defaultTimeoutMs = positiveInteger(config.defaultTimeoutMs, 30 * 60 * 1000);
+  config.defaultTimeoutMs = Math.min(MAX_TASK_TIMEOUT_MS, Math.max(1000, positiveInteger(config.defaultTimeoutMs, DEFAULT_TASK_TIMEOUT_MS)));
   config.maxWaitMs = Math.max(1000, positiveInteger(config.maxWaitMs, 60 * 1000));
   config.maxPromptChars = positiveInteger(config.maxPromptChars, 20000);
   config.maxDiscussionRounds = Math.min(3, positiveInteger(config.maxDiscussionRounds, 3));
@@ -687,9 +687,11 @@ export function parseJsonLine(line) {
   }
 }
 
-export function extractText(value) {
+export function extractText(value, depth = 0) {
+  if (depth > 8) return "";
   if (typeof value === "string") return value;
   if (!value || typeof value !== "object") return "";
+  if (Array.isArray(value)) return value.map((item) => extractText(item, depth + 1)).join("");
   const candidates = [
     value.text,
     value.text_delta,
@@ -704,14 +706,8 @@ export function extractText(value) {
   ];
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate.trim()) return candidate;
-    if (Array.isArray(candidate)) {
-      const text = candidate
-        .map((item) => (typeof item === "string" ? item : item?.text ?? item?.content ?? ""))
-        .join("");
-      if (text.trim()) return text;
-    }
     if (candidate && typeof candidate === "object") {
-      const nested = extractText(candidate);
+      const nested = extractText(candidate, depth + 1);
       if (nested.trim()) return nested;
     }
   }

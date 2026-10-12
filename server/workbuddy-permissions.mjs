@@ -10,6 +10,7 @@ export const WORKBUDDY_CONTAINED_TOOLS = Object.freeze(["Read", "Write", "Edit",
 export const WORKBUDDY_PROVIDER_NETWORK_HOSTS = Object.freeze([
   "copilot.tencent.com",
   "galileotelemetry.tencent.com",
+  "www.workbuddy.cn",
 ]);
 export const WORKBUDDY_LOOPBACK_NETWORK_LIMITATION = "WorkBuddy normalizes its proxy to 127.0.0.1; the compatibility loopback rule does not prevent a provider Bash process from making direct local-loopback connections outside the task proxy";
 

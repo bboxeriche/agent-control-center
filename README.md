@@ -39,6 +39,8 @@ Agent Control Center
 
 ACC stores the task, provider events, discussions, and generated minutes locally. The control service accepts registered provider commands from configuration; an API request cannot provide an arbitrary command.
 
+Final-answer evidence is stored separately from accumulated provider output. Antigravity's successful nested `result.response` is recognized as a final answer; progress updates and interrupted partial responses are not promoted to that field. Mechanical outcome and semantic verification remain separate.
+
 ## Supported providers
 
 | Provider | Integration | Capability notes |
@@ -49,6 +51,8 @@ ACC stores the task, provider events, discussions, and generated minutes locally
 | Tencent WorkBuddy/CodeBuddy | CLI or configured HTTP jobs API | The adapter reports unavailable or unhealthy paths explicitly. |
 
 Provider health is independent: an unavailable provider does not prevent the other adapters or the local Codex MCP surface from working.
+
+On macOS, Codex CLI discovery checks the current `ChatGPT.app` / `Codex.app` bundled `codex-cli` layouts and the legacy `Contents/Resources/codex` layout before falling back to `codex` on the service's PATH. Explicit command overrides remain authoritative. This avoids treating a desktop app layout update as a missing CLI or authentication failure.
 
 ## Quick start
 
@@ -77,7 +81,7 @@ The repository includes `.codex-plugin/plugin.json` and `.mcp.json`. To use the 
 
 Antigravity headless permission mapping is fail-closed and task-scoped. On macOS, ACC uses a `sandbox-exec` profile plus a local network proxy for the supported external-containment profiles. The profile permits writes only under the effective task scope, routes network requests through the task proxy, denies common credential-shaped paths by default, and is removed after provider exit, stop, error, or timeout. Persistent Antigravity settings are not edited.
 
-Tencent WorkBuddy/CodeBuddy CLI tasks use the same task-scoped containment primitives. For the validated WorkBuddy `2.106.4` CLI, ACC pins the default model to `hy4-preview`, passes an explicit per-run `--permission-mode bypassPermissions`, and restricts contained runs to `Read,Write,Edit,Bash,Glob,Grep`. The provider bypass is only a headless approval setting; the ACC boundary remains the canonical filesystem scope, sensitive-path deny rules, task proxy, and cleanup receipt. WorkBuddy's remote `WebFetch` and `WebSearch` tools are disabled in contained runs because they execute outside the local ACC network boundary. Persistent WorkBuddy settings are not edited. Provider-managed `.codebuddy/projects` session files are left under the provider's ownership and are not mistaken for the task cleanup directory.
+Tencent WorkBuddy/CodeBuddy CLI tasks use the same task-scoped containment primitives. For the validated WorkBuddy `2.106.4` CLI, ACC pins the default model to `hy4-preview`, passes an explicit per-run `--permission-mode bypassPermissions`, and restricts contained runs to `Read,Write,Edit,Bash,Glob,Grep`. The provider bypass is only a headless approval setting; the ACC boundary remains the canonical filesystem scope, sensitive-path deny rules, task proxy, and cleanup receipt. The provider transport allowlist includes the exact hosts `copilot.tencent.com`, `galileotelemetry.tencent.com`, and `www.workbuddy.cn`; current WorkBuddy CLIs use the last host even when task network access is disabled. WorkBuddy's remote `WebFetch` and `WebSearch` tools are disabled in contained runs because they execute outside the local ACC network boundary. Persistent WorkBuddy settings are not edited. Provider-managed `.codebuddy/projects` session files are left under the provider's ownership and are not mistaken for the task cleanup directory.
 
 ## Known limitations
 
@@ -109,6 +113,12 @@ The durable task contract is:
 - `GET /api/tasks/:taskId/wait?timeoutMs=N&afterCursor=N` is bounded by `maxWaitMs` (60 seconds by default). A timeout is a normal snapshot, not a task failure.
 
 The same operations are available through the `acc_task_*` MCP tools, including `acc_task_wait`. The `after` query/tool field remains a compatibility alias for `afterCursor`.
+
+Task execution defaults to **60 minutes**, configurable with `defaultTimeoutMs`. The per-attempt ceiling is **24 hours**; an explicit shorter `timeoutMs` remains authoritative. Dashboard task creation and completed-task follow-ups expose a minutes field. A follow-up can set a new `timeoutMs` for its next attempt, while an active attempt's timer cannot be extended by a live reply. Stop and cleanup still apply. The separate 60-second client wait ceiling is not the task execution ceiling.
+
+ACC maps Antigravity's `--print-timeout` below the outer task watchdog, reserving 5% of the budget (at least five seconds and at most one minute for normal tasks) for startup, output collection and cleanup. Short tasks reserve at most half their budget. Increasing the budget gives a long task more execution time; it does not guarantee completion or semantic correctness.
+
+The Dashboard uses the authenticated, same-origin `/api/activity/stream` for compact lifecycle invalidations. It reloads task snapshots, all already-loaded pages, provider execution records and an open detail view after changes; it also reconciles after reconnect, returning to a visible tab or going online. Four-second polling remains as a fallback. This does not add an external gateway or push to ChatGPT/DevSpace. `/api/agents?cached=1` refreshes execution records without pretending a cached version/auth probe is fresh; provider probes continue separately.
 
 ### DevSpace authenticated client
 
