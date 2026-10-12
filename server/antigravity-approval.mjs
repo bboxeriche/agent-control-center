@@ -33,9 +33,10 @@ export function createTaskScopedAntigravityApproval({ taskId, cwd, projectsRoot 
     ...ANTIGRAVITY_READ_ONLY_COMMANDS.filter((command) => command.startsWith("git "))
       .map((command) => `command(git --no-optional-locks ${command.slice(4)})`),
   ];
-  // A fresh project adds only these explicit approvals. Existing global/shared
-  // deny/ask rules still take precedence; never edit or bypass them. The outer
-  // ACC sandbox remains authoritative even for inherited command grants.
+  // A fresh project adds only these explicit approvals and denies; existing
+  // settings are never edited. Deny rules remain in force, while an explicit
+  // skip-permissions invocation bypasses Ask prompts. The outer ACC sandbox
+  // remains authoritative even for inherited command grants.
   const project = {
     id, name,
     projectResources: { resources: [{ folderUri: pathToFileURL(canonicalCwd).href }] },
@@ -76,7 +77,7 @@ export function cleanupTaskScopedAntigravityApproval(record, { projectsRoot = an
   unlinkSync(record.path);
 }
 
-export function argsForTaskScopedAntigravityApproval(providerArgs, record) {
+export function argsForTaskScopedAntigravityApproval(providerArgs, record, { skipPermissions = false } = {}) {
   const valueFlags = new Set(["-p", "--print", "--prompt", "-i", "--prompt-interactive", "--model", "--effort", "--agent", "--conversation", "--add-dir", "--mode", "--input-format", "--output-format", "--json-schema", "--log-file", "--print-timeout"]);
   const args = [];
   for (let index = 0; index < providerArgs.length; index += 1) {
@@ -87,7 +88,8 @@ export function argsForTaskScopedAntigravityApproval(providerArgs, record) {
       continue;
     }
     if (/^--dangerously-skip-permissions(?:=|$)/.test(arg)) {
-      throw new Error("read-only Antigravity cannot bypass tool permissions");
+      if (!skipPermissions) throw new Error("read-only Antigravity cannot bypass tool permissions without explicit skip-permissions mode");
+      continue; // Normalize a configured bypass to exactly one explicit flag.
     }
     if (arg === "--project") { index += 1; continue; }
     if (/^--project=/.test(arg) || /^--sandbox(?:=|$)/.test(arg)) continue;
@@ -96,5 +98,5 @@ export function argsForTaskScopedAntigravityApproval(providerArgs, record) {
   }
   // macOS will not apply agy's second Seatbelt sandbox inside ACC's sandbox.
   // Keep the outer kernel boundary; disable only the redundant inner layer.
-  return [...args, "--sandbox=false", "--project", record.id];
+  return [...args, "--sandbox=false", "--project", record.id, ...(skipPermissions ? ["--dangerously-skip-permissions"] : [])];
 }

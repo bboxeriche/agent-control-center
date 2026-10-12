@@ -8,6 +8,7 @@ import test from "node:test";
 import { argsForTaskScopedAntigravityApproval, cleanupTaskScopedAntigravityApproval, createTaskScopedAntigravityApproval } from "../server/antigravity-approval.mjs";
 import { cleanupOrphanedAntigravityContainments, prepareAntigravityContainment } from "../server/antigravity-containment.mjs";
 import { CliAdapter } from "../server/adapters.mjs";
+import { antigravityCapabilityReport, antigravityHeadlessApprovalMode, preflightAntigravityExecutionProfile } from "../server/antigravity-permissions.mjs";
 
 test("isolates native command approvals without changing global or existing project settings", () => {
   const root = mkdtempSync(join(tmpdir(), "acc-approval-fixture-"));
@@ -58,6 +59,54 @@ test("overrides only task project/sandbox arguments and rejects blanket permissi
   for (const arg of ["--dangerously-skip-permissions", "--dangerously-skip-permissions=true"]) {
     assert.throws(() => argsForTaskScopedAntigravityApproval(["-p", "probe", arg], record), /cannot bypass/);
   }
+});
+
+test("normalizes the skip flag only after explicit opt-in and preserves literal prompt values", () => {
+  const record = { id: "isolated-project" };
+  const args = argsForTaskScopedAntigravityApproval(["--print", "--dangerously-skip-permissions", "--dangerously-skip-permissions=false", "--project=old"], record, { skipPermissions: true });
+  assert.deepEqual(args, ["--print", "--dangerously-skip-permissions", "--sandbox=false", "--project", record.id, "--dangerously-skip-permissions"]);
+  assert.equal(antigravityHeadlessApprovalMode(), "project-grants");
+  assert.equal(antigravityHeadlessApprovalMode({ headlessApprovalMode: "skip-permissions" }), "skip-permissions");
+  assert.throws(() => antigravityHeadlessApprovalMode({ headlessApprovalMode: "turbo-typo" }), /unknown/);
+});
+
+test("skip mode reports its real native mode and cannot override explicit approval policies", () => {
+  const mapping = { strategy: "sandbox-exec-proxy", headlessApprovalMode: "skip-permissions" };
+  const report = antigravityCapabilityReport(mapping);
+  assert.equal(report.mapping.headlessCommandApproval.approvalMode, "skip-permissions");
+  assert.deepEqual(report.mapping.headlessCommandApproval.qualifiedProviderVersions, ["1.3.3"]);
+  assert.equal(report.executionProfiles.find(profile => profile.profile === "read_only").nativeMode, "skip-permissions-with-task-project-denies");
+  for (const approvalPolicy of ["require_approval", "deny_unapproved"]) {
+    const profile = preflightAntigravityExecutionProfile({ effective: { writeAllowed: false, networkAllowed: false, approvalPolicy } }, mapping);
+    assert.equal(profile.status, "UNSUPPORTED");
+    assert.equal(profile.code, "antigravity_headless_skip_conflicts_with_approval_policy");
+  }
+});
+
+test("opt-in contained skip retains native deny rules, outer read-only scope and cleanup", async (t) => {
+  if (process.platform !== "darwin") { t.skip("macOS containment fixture"); return; }
+  const root = mkdtempSync(join(tmpdir(), "acc-contained-skip-"));
+  const projectsRoot = join(root, "projects");
+  let boundary;
+  try {
+    boundary = await prepareAntigravityContainment({ taskId: "skip", cwd: root, command: "/bin/sh", permissionPolicy: { effective: { writeAllowed: false, networkAllowed: false, filesystemScope: [root] } }, config: { headlessApprovalMode: "skip-permissions", taskRoot: join(root, "tasks"), projectsRoot } });
+    const args = boundary.argsFor(["-p", "probe"], { skipPermissions: false });
+    assert.equal(args.filter(arg => arg === "--dangerously-skip-permissions").length, 1);
+    assert.equal(args.includes("--sandbox=false"), true);
+    const receipt = boundary.permissionReceipt;
+    assert.equal(receipt.writeAllowed, false);
+    assert.equal(receipt.networkAllowed, false);
+    assert.equal(receipt.headlessApproval.approvalMode, "skip-permissions");
+    assert.equal(receipt.headlessApproval.defaultCommandApproval, "skip-ask-retain-deny");
+    assert.match(receipt.headlessApproval.inheritedRules, /Ask prompts are bypassed/);
+    const project = JSON.parse(readFileSync(join(projectsRoot, `${receipt.headlessApproval.projectId}.json`), "utf8"));
+    for (const rule of ["write_file(*)", "read_url(*)", "execute_url(*)", "mcp(*)"]) assert.ok(project.permissionGrants.permissionGrants.deny.includes(rule));
+    const write = spawnSync("/usr/bin/sandbox-exec", ["-f", boundary.profilePath, "/bin/sh", "-c", "printf denied > blocked.txt"], { cwd: root, env: { ...process.env, ...boundary.env }, encoding: "utf8" });
+    assert.notEqual(write.status, 0);
+    assert.equal(existsSync(join(root, "blocked.txt")), false);
+    assert.equal((await boundary.cleanup("test")).approvalProjectState, "removed");
+    assert.deepEqual(readdirSync(projectsRoot), []);
+  } finally { await boundary?.cleanup("test"); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("never deletes changed approval files, symlinks, or arbitrary cleanup targets", () => {

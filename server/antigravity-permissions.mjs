@@ -6,6 +6,14 @@ export const NATIVE_PERMISSION_MAPPING_UNAVAILABLE = "native_permission_mapping_
 export const ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY = "sandbox-exec-proxy";
 export const ANTIGRAVITY_PROFILE_UNSUPPORTED = "antigravity_execution_profile_unsupported";
 
+export function antigravityHeadlessApprovalMode(config = {}) {
+  const mode = config.headlessApprovalMode || "project-grants";
+  if (!["project-grants", "skip-permissions"].includes(mode)) {
+    throw new Error(`unknown Antigravity headlessApprovalMode: ${mode}`);
+  }
+  return mode;
+}
+
 const PROFILE_CATALOG = Object.freeze({
   read_only: Object.freeze({
     profile: "read_only",
@@ -55,6 +63,16 @@ const PROFILE_CATALOG = Object.freeze({
 
 export const ANTIGRAVITY_EXECUTION_PROFILES = Object.freeze({ ...PROFILE_CATALOG });
 
+function executionProfile(key, approvalMode) {
+  const base = PROFILE_CATALOG[key];
+  if (key !== "read_only" || approvalMode !== "skip-permissions") return base;
+  return {
+    ...base,
+    nativeMode: "skip-permissions-with-task-project-denies",
+    reason: "skip-permissions bypasses command Ask prompts; explicit task-project write/web/MCP deny rules and external write/egress containment remain in force (qualified with agy 1.3.3)",
+  };
+}
+
 const NETWORK_ACTIONS = Object.freeze([
   "read_url",
   "search_web",
@@ -93,11 +111,15 @@ function unavailableProfile({ code = ANTIGRAVITY_PROFILE_UNSUPPORTED, reason, pr
 
 export function preflightAntigravityExecutionProfile(
   permissionPolicy,
-  { strategy = ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY, platform = process.platform, sandboxExecutable = "/usr/bin/sandbox-exec" } = {},
+  { strategy = ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY, platform = process.platform, sandboxExecutable = "/usr/bin/sandbox-exec", headlessApprovalMode = "project-grants" } = {},
 ) {
   const effective = effectivePolicy(permissionPolicy);
   const key = profileKey(effective);
-  const base = PROFILE_CATALOG[key];
+  const approvalMode = antigravityHeadlessApprovalMode({ headlessApprovalMode });
+  const base = executionProfile(key, approvalMode);
+  if (approvalMode === "skip-permissions" && effective.approvalPolicy && effective.approvalPolicy !== "provider_default") {
+    return { ...unavailableProfile({ code: "antigravity_headless_skip_conflicts_with_approval_policy", reason: "skip-permissions cannot satisfy an explicit require_approval or deny_unapproved request; no provider was spawned", profile: key, effective }), mechanism: strategy, effective };
+  }
   if (key === "read_only" && effective.approvalPolicy === "require_approval") {
     return { ...unavailableProfile({ code: "antigravity_headless_approval_required", reason: "explicit require_approval cannot be satisfied by Antigravity's non-interactive print mode; no auto-approval grants were installed", profile: key, effective }), mechanism: strategy, effective };
   }
@@ -158,6 +180,7 @@ export function antigravityCapabilityReport(
   { platform = process.platform, sandboxExecutable = config.sandboxExecutable || "/usr/bin/sandbox-exec" } = {},
 ) {
   const strategy = String(config.strategy || "unknown");
+  const approvalMode = antigravityHeadlessApprovalMode(config);
   const externalAvailable = strategy === ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY
     && platform === "darwin"
     && existsSync(sandboxExecutable);
@@ -175,7 +198,13 @@ export function antigravityCapabilityReport(
       scope: "task",
       safePerProcessOverride: false,
       persistentSettingsMutation: false,
-      headlessCommandApproval: { strategy: "task-scoped-project-grants", profile: "read_only", qualifiedProviderVersions: ["1.2.17", "1.3.3"], globalSettingsMutation: false },
+      headlessCommandApproval: {
+        strategy: approvalMode === "skip-permissions" ? "task-scoped-project-denies-with-skip-permissions" : "task-scoped-project-grants",
+        approvalMode,
+        profile: "read_only",
+        qualifiedProviderVersions: approvalMode === "skip-permissions" ? ["1.3.3"] : ["1.2.17", "1.3.3"],
+        globalSettingsMutation: false,
+      },
     },
     externalContainment: {
       strategy: strategy === ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY ? strategy : "none",
@@ -195,7 +224,7 @@ export function antigravityCapabilityReport(
       sensitivePaths: externalAvailable ? "task-default-deny" : "unknown",
       cleanup: externalAvailable ? "task-scoped" : "unknown",
     },
-    executionProfiles: Object.values(PROFILE_CATALOG),
+    executionProfiles: Object.keys(PROFILE_CATALOG).map((key) => executionProfile(key, approvalMode)),
   };
 }
 

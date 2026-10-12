@@ -466,6 +466,7 @@ export class CliAdapter {
     const preflight = preflightAntigravityExecutionProfile(spec.permissionPolicy, {
       strategy: this.config.permissionMapping?.strategy || ANTIGRAVITY_CONTAINMENT_STRATEGY,
       sandboxExecutable: this.config.permissionMapping?.sandboxExecutable || "/usr/bin/sandbox-exec",
+      headlessApprovalMode: this.config.permissionMapping?.headlessApprovalMode,
     });
     if (preflight.status !== "SUPPORTED") {
       throw new NativePermissionMappingUnavailableError(
@@ -485,7 +486,7 @@ export class CliAdapter {
       return this.startProcess(spec, onEvent, {
         command: containment.sandboxExecutable,
         args: containment.argsFor(antigravityCommandArgs(this.config, spec), {
-          // Read-only runs get ephemeral project grants, not a blanket bypass.
+          // Read-only skip mode retains the isolated project's explicit denies.
           // External containment remains authoritative for writes and egress.
           skipPermissions: effective.writeAllowed === true || effective.networkAllowed === true,
         }),

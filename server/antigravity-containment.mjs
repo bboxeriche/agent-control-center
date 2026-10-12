@@ -16,6 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { DEFAULT_SENSITIVE_PATH_PATTERNS } from "./core.mjs";
 import {
   ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY,
+  antigravityHeadlessApprovalMode,
   preflightAntigravityExecutionProfile,
 } from "./antigravity-permissions.mjs";
 import {
@@ -469,10 +470,12 @@ export async function prepareAntigravityContainment({
     throw error;
   }
   const effective = effectivePolicy(permissionPolicy);
+  const approvalMode = antigravityHeadlessApprovalMode(config);
   const preflight = preflightAntigravityExecutionProfile(permissionPolicy, {
     strategy: config.strategy || ANTIGRAVITY_CONTAINMENT_STRATEGY,
     platform: process.platform,
     sandboxExecutable,
+    headlessApprovalMode: approvalMode,
   });
   if (preflight.status !== "SUPPORTED") {
     const error = new Error(`${preflight.code}: ${preflight.reason}`);
@@ -543,7 +546,7 @@ export async function prepareAntigravityContainment({
       logPath,
       providerHosts,
       argsFor(providerArgs, { skipPermissions = true } = {}) {
-        const scopedArgs = approvalProject ? argsForTaskScopedAntigravityApproval(providerArgs, approvalProject) : providerArgs;
+        const scopedArgs = approvalProject ? argsForTaskScopedAntigravityApproval(providerArgs, approvalProject, { skipPermissions: approvalMode === "skip-permissions" }) : providerArgs;
         const args = ["-f", profilePath, command, ...scopedArgs];
         if (!approvalProject && skipPermissions && !args.includes("--dangerously-skip-permissions")) args.push("--dangerously-skip-permissions");
         if (!args.includes("--log-file")) args.push("--log-file", logPath);
@@ -571,11 +574,15 @@ export async function prepareAntigravityContainment({
         externalNetwork: effective.networkAllowed === true ? "allowlisted-proxy-wildcard" : "provider-hosts-only",
         persistentSettingsMutation: false,
         ...(approvalProject ? { headlessApproval: {
-          strategy: "task-scoped-project-grants",
+          strategy: approvalMode === "skip-permissions" ? "task-scoped-project-denies-with-skip-permissions" : "task-scoped-project-grants",
+          approvalMode,
+          defaultCommandApproval: approvalMode === "skip-permissions" ? "skip-ask-retain-deny" : "ask-unless-granted",
           projectId: approvalProject.id,
           approvedCommands: approvalProject.approvedCommands,
           forbiddenNativeTools: ["write_file", "read_url", "execute_url", "mcp"],
-          inheritedRules: "global/shared deny and ask rules still apply; outer containment remains authoritative",
+          inheritedRules: approvalMode === "skip-permissions"
+            ? "explicit native deny rules still apply; Ask prompts are bypassed; outer containment remains authoritative"
+            : "global/shared deny and ask rules still apply; outer containment remains authoritative",
           lifecycle: "removed-on-exit-stop-timeout-or-spawn-error",
         } } : {}),
         sensitivePathPolicy: effective.sensitivePathPolicy || { mode: "deny", patterns: DEFAULT_SENSITIVE_PATH_PATTERNS },

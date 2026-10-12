@@ -285,6 +285,7 @@ export class ControlPlane {
       const executionProfile = preflightAntigravityExecutionProfile(permissionPolicy, {
         strategy: mapping.strategy,
         sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+        headlessApprovalMode: mapping.headlessApprovalMode,
       });
       permissionPolicy.capabilityReport = capabilityReport;
       permissionPolicy.executionProfile = executionProfile;
@@ -675,6 +676,7 @@ export class ControlPlane {
       const executionProfile = preflightAntigravityExecutionProfile(permissionPolicy, {
         strategy: mapping.strategy,
         sandboxExecutable: mapping.sandboxExecutable || "/usr/bin/sandbox-exec",
+        headlessApprovalMode: mapping.headlessApprovalMode,
       });
       permissionPolicy.capabilityReport = capabilityReport;
       permissionPolicy.executionProfile = executionProfile;
