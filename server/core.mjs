@@ -446,7 +446,7 @@ const DEFAULT_AGENTS = {
     supportsResume: false,
     permissionMapping: {
       strategy: "sandbox-exec-proxy",
-      reason: "agy 1.1.27 exposes no safe per-process permission override; use task-scoped external containment",
+      reason: "use task-scoped external containment, with isolated native command approvals for read-only headless tasks",
       providerHosts: [
         "accounts.google.com",
         "daily-cloudcode-pa.googleapis.com",

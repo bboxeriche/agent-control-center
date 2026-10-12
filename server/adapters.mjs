@@ -485,10 +485,8 @@ export class CliAdapter {
       return this.startProcess(spec, onEvent, {
         command: containment.sandboxExecutable,
         args: containment.argsFor(antigravityCommandArgs(this.config, spec), {
-          // With no capabilities requested, leave agy in its own headless
-          // request-review mode so native write/network requests are denied.
-          // Any policy that needs a capability uses the skip flag, with the
-          // external sandbox enforcing the remaining filesystem boundary.
+          // Read-only runs get ephemeral project grants, not a blanket bypass.
+          // External containment remains authoritative for writes and egress.
           skipPermissions: effective.writeAllowed === true || effective.networkAllowed === true,
         }),
         env: { ...this.config.env, ...containment.env },

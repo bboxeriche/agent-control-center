@@ -198,6 +198,7 @@ test("waits for contained provider cleanup before finalizing a timed-out task", 
     permissionMapping: {
       strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY,
       taskRoot,
+      projectsRoot: join(dataDir, "native-projects"),
       providerHosts: [],
     },
   };
@@ -213,6 +214,8 @@ test("waits for contained provider cleanup before finalizing a timed-out task", 
     assert.equal(finished.status, "timed_out");
     const completion = plane.listTaskEvents(task.id, 0).find((event) => event.eventType === "task_finished");
     assert.equal(completion?.payload?.permissionCleanup?.state, "cleaned");
+    assert.equal(completion?.payload?.permissionCleanup?.approvalProjectState, "removed");
+    assert.deepEqual(await readdir(join(dataDir, "native-projects")), []);
     assert.deepEqual(await readdir(taskRoot), []);
   } finally {
     await plane.shutdown();
@@ -241,6 +244,7 @@ test("cleans Antigravity containment after a stopped task", async (t) => {
     permissionMapping: {
       strategy: ANTIGRAVITY_CONTAINMENT_STRATEGY,
       taskRoot,
+      projectsRoot: join(dataDir, "native-projects"),
       providerHosts: [],
     },
   };
@@ -261,6 +265,8 @@ test("cleans Antigravity containment after a stopped task", async (t) => {
     assert.equal(stopped.status, "stopped");
     const completion = plane.listTaskEvents(task.id, 0).find((event) => event.eventType === "task_finished");
     assert.equal(completion?.payload?.permissionCleanup?.state, "cleaned");
+    assert.equal(completion?.payload?.permissionCleanup?.approvalProjectState, "removed");
+    assert.deepEqual(await readdir(join(dataDir, "native-projects")), []);
     assert.deepEqual(await readdir(taskRoot), []);
   } finally {
     await plane.shutdown();

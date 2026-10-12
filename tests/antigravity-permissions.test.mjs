@@ -4,7 +4,7 @@ import { request as httpRequest } from "node:http";
 import test from "node:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CliAdapter } from "../server/adapters.mjs";
 import {
   ANTIGRAVITY_CONTAINMENT_STRATEGY,
@@ -42,14 +42,14 @@ test("uses task-scoped external containment when native agy mapping is unavailab
       taskId: "task-a",
       cwd: scopeA,
       permissionPolicy: { effective: { writeAllowed: true, networkAllowed: true, filesystemScope: [scopeA] } },
-      config: { taskRoot, providerHosts: ["daily-cloudcode-pa.googleapis.com"] },
+      config: { taskRoot, projectsRoot: join(root, "projects"), providerHosts: ["daily-cloudcode-pa.googleapis.com"] },
       command: "/bin/sh",
     }),
     prepareAntigravityContainment({
       taskId: "task-b",
       cwd: scopeB,
       permissionPolicy: { effective: { writeAllowed: false, networkAllowed: false, filesystemScope: [scopeB] } },
-      config: { taskRoot, providerHosts: ["daily-cloudcode-pa.googleapis.com"] },
+      config: { taskRoot, projectsRoot: join(root, "projects"), providerHosts: ["daily-cloudcode-pa.googleapis.com"] },
       command: "/bin/sh",
     }),
   ]);
@@ -63,6 +63,13 @@ test("uses task-scoped external containment when native agy mapping is unavailab
     assert.ok(first.argsFor(["-p", "probe"]).includes("--dangerously-skip-permissions"));
     assert.ok(first.argsFor(["-p", "probe"]).includes("--log-file"));
     assert.equal(first.argsFor(["-p", "probe"], { skipPermissions: false }).includes("--dangerously-skip-permissions"), false);
+    const readOnlyArgs = second.argsFor(["-p", "probe"]);
+    assert.equal(readOnlyArgs.includes("--dangerously-skip-permissions"), false);
+    assert.equal(readOnlyArgs.includes("--sandbox=false"), true);
+    assert.equal(second.permissionReceipt.headlessApproval.strategy, "task-scoped-project-grants");
+    assert.equal(readOnlyArgs[readOnlyArgs.indexOf("--project") + 1], second.permissionReceipt.headlessApproval.projectId);
+    assert.equal(second.env.TMPDIR, dirname(second.profilePath));
+    assert.equal(second.env.GIT_OPTIONAL_LOCKS, "0");
     assert.equal(networkTargetAllowed("example.com", { networkAllowed: false, providerHosts: ["daily-cloudcode-pa.googleapis.com"] }), false);
     assert.equal(networkTargetAllowed("daily-cloudcode-pa.googleapis.com", { networkAllowed: false, providerHosts: ["daily-cloudcode-pa.googleapis.com"] }), true);
     assert.equal(networkTargetAllowed("example.com", { networkAllowed: true, providerHosts: [] }), true);

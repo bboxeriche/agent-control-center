@@ -13,8 +13,8 @@ const PROFILE_CATALOG = Object.freeze({
     networkAllowed: false,
     status: "SUPPORTED",
     code: "antigravity_profile_read_only_supported",
-    reason: "native request-review plus external containment denies task writes and non-provider network targets",
-    nativeMode: "request-review",
+    reason: "task-scoped native project grants approve common read-only commands; native write/web/MCP tools are denied and external containment enforces task writes and network egress",
+    nativeMode: "request-review-with-task-project-grants",
     externalWrite: "deny",
     externalNetwork: "provider-hosts-only",
   }),
@@ -98,6 +98,9 @@ export function preflightAntigravityExecutionProfile(
   const effective = effectivePolicy(permissionPolicy);
   const key = profileKey(effective);
   const base = PROFILE_CATALOG[key];
+  if (key === "read_only" && effective.approvalPolicy === "require_approval") {
+    return { ...unavailableProfile({ code: "antigravity_headless_approval_required", reason: "explicit require_approval cannot be satisfied by Antigravity's non-interactive print mode; no auto-approval grants were installed", profile: key, effective }), mechanism: strategy, effective };
+  }
   if (strategy === "test-double") {
     return {
       ...base,
@@ -111,7 +114,7 @@ export function preflightAntigravityExecutionProfile(
   if (strategy !== ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY) {
     return {
       ...unavailableProfile({
-        reason: "agy 1.1.27 exposes no safe per-process native permission override and no approved external containment strategy is configured",
+        reason: "no qualified general per-process native permission override or approved external containment strategy is configured",
         profile: key,
         effective,
       }),
@@ -165,13 +168,14 @@ export function antigravityCapabilityReport(
       permissionOverride: "unsupported",
       enforcement: { write: "unavailable", network: "unavailable", sensitivePaths: "unavailable" },
       reasonCode: NATIVE_PERMISSION_MAPPING_UNAVAILABLE,
-      reason: "agy 1.1.27 exposes no safe per-process permission override; persistent settings are not task-scoped",
+      reason: "general per-process native permission enforcement remains unqualified; read-only command approvals use an isolated task project with external containment",
     },
     mapping: {
       strategy,
       scope: "task",
       safePerProcessOverride: false,
       persistentSettingsMutation: false,
+      headlessCommandApproval: { strategy: "task-scoped-project-grants", profile: "read_only", qualifiedProviderVersions: ["1.2.17", "1.3.3"], globalSettingsMutation: false },
     },
     externalContainment: {
       strategy: strategy === ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY ? strategy : "none",
@@ -250,7 +254,7 @@ export function rulesForEffectivePolicy(permissionPolicy) {
 }
 
 export class NativePermissionMappingUnavailableError extends Error {
-  constructor(permissionPolicy, reason = "agy 1.1.27 exposes no safe per-run permission override", preflight = null) {
+  constructor(permissionPolicy, reason = "no qualified general per-run native permission override is available", preflight = null) {
     super(`${NATIVE_PERMISSION_MAPPING_UNAVAILABLE}: ${reason}`);
     this.name = "NativePermissionMappingUnavailableError";
     this.code = NATIVE_PERMISSION_MAPPING_UNAVAILABLE;

@@ -18,6 +18,12 @@ import {
   ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY,
   preflightAntigravityExecutionProfile,
 } from "./antigravity-permissions.mjs";
+import {
+  antigravityProjectsRoot,
+  argsForTaskScopedAntigravityApproval,
+  cleanupTaskScopedAntigravityApproval,
+  createTaskScopedAntigravityApproval,
+} from "./antigravity-approval.mjs";
 
 export const ANTIGRAVITY_CONTAINMENT_STRATEGY = ANTIGRAVITY_EXTERNAL_CONTAINMENT_STRATEGY;
 export const ANTIGRAVITY_CONTAINMENT_UNAVAILABLE = "antigravity_containment_unavailable";
@@ -419,7 +425,7 @@ function aliveProcess(pid) {
   }
 }
 
-export function cleanupOrphanedAntigravityContainments({ root = containmentRoot(), maxAgeMs = 24 * 60 * 60 * 1000 } = {}) {
+export function cleanupOrphanedAntigravityContainments({ root = containmentRoot(), projectsRoot = antigravityProjectsRoot(), maxAgeMs = 24 * 60 * 60 * 1000 } = {}) {
   const directory = resolve(root);
   if (!existsSync(directory)) return 0;
   let removed = 0;
@@ -437,6 +443,7 @@ export function cleanupOrphanedAntigravityContainments({ root = containmentRoot(
     const createdAt = Number(metadata?.createdAt || 0);
     if (metadata?.pid && aliveProcess(Number(metadata.pid))) continue;
     if (createdAt && createdAt > cutoff) continue;
+    cleanupTaskScopedAntigravityApproval(metadata?.approvalProject, { projectsRoot });
     rmSync(taskDirectory, { recursive: true, force: true });
     removed += 1;
   }
@@ -481,12 +488,19 @@ export async function prepareAntigravityContainment({
   const rootPath = containmentRoot(config);
   mkdirSync(rootPath, { recursive: true, mode: 0o700 });
   const root = realpathSync(rootPath);
-  cleanupOrphanedAntigravityContainments({ root, maxAgeMs: Number(config.orphanMaxAgeMs) || 24 * 60 * 60 * 1000 });
+  const projectsRoot = config.projectsRoot || antigravityProjectsRoot();
+  cleanupOrphanedAntigravityContainments({ root, projectsRoot, maxAgeMs: Number(config.orphanMaxAgeMs) || 24 * 60 * 60 * 1000 });
   const taskDirectory = safeTaskDirectory(root, taskId);
   const logPath = join(taskDirectory, "agy.log");
   let proxy;
+  let approvalProject;
   try {
-    writeFileSync(join(taskDirectory, "owner.json"), JSON.stringify({ taskId, pid: process.pid, createdAt: Date.now() }) + "\n", { mode: 0o600 });
+    const writeOwner = (record) => {
+      writeFileSync(join(taskDirectory, "owner.json"), JSON.stringify({ taskId, pid: process.pid, createdAt: Date.now(), approvalProject: record }) + "\n", { mode: 0o600 });
+    };
+    if (preflight.profile === "read_only") {
+      approvalProject = createTaskScopedAntigravityApproval({ taskId, cwd: canonicalCwd, projectsRoot, beforeCreate: (record) => { approvalProject = record; writeOwner(record); } });
+    } else writeOwner();
     proxy = await startTaskNetworkProxy({
       networkAllowed: effective.networkAllowed === true,
       providerHosts: config.providerHosts,
@@ -509,6 +523,7 @@ export async function prepareAntigravityContainment({
       if (cleanupPromise) return cleanupPromise;
       cleanupPromise = (async () => {
         await proxy.close();
+        cleanupTaskScopedAntigravityApproval(approvalProject, { projectsRoot });
         rmSync(taskDirectory, { recursive: true, force: true });
         cleaned = true;
         return {
@@ -516,6 +531,7 @@ export async function prepareAntigravityContainment({
           reason,
           taskId,
           taskDirectory,
+          ...(approvalProject ? { approvalProjectId: approvalProject.id, approvalProjectState: "removed" } : {}),
         };
       })();
       return cleanupPromise;
@@ -527,12 +543,15 @@ export async function prepareAntigravityContainment({
       logPath,
       providerHosts,
       argsFor(providerArgs, { skipPermissions = true } = {}) {
-        const args = ["-f", profilePath, command, ...providerArgs];
-        if (skipPermissions && !args.includes("--dangerously-skip-permissions")) args.push("--dangerously-skip-permissions");
+        const scopedArgs = approvalProject ? argsForTaskScopedAntigravityApproval(providerArgs, approvalProject) : providerArgs;
+        const args = ["-f", profilePath, command, ...scopedArgs];
+        if (!approvalProject && skipPermissions && !args.includes("--dangerously-skip-permissions")) args.push("--dangerously-skip-permissions");
         if (!args.includes("--log-file")) args.push("--log-file", logPath);
         return args;
       },
       env: {
+        TMPDIR: taskDirectory,
+        GIT_OPTIONAL_LOCKS: "0",
         HTTP_PROXY: `http://127.0.0.1:${proxy.port}`,
         HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`,
         ALL_PROXY: `http://127.0.0.1:${proxy.port}`,
@@ -551,6 +570,14 @@ export async function prepareAntigravityContainment({
         providerHosts,
         externalNetwork: effective.networkAllowed === true ? "allowlisted-proxy-wildcard" : "provider-hosts-only",
         persistentSettingsMutation: false,
+        ...(approvalProject ? { headlessApproval: {
+          strategy: "task-scoped-project-grants",
+          projectId: approvalProject.id,
+          approvedCommands: approvalProject.approvedCommands,
+          forbiddenNativeTools: ["write_file", "read_url", "execute_url", "mcp"],
+          inheritedRules: "global/shared deny and ask rules still apply; outer containment remains authoritative",
+          lifecycle: "removed-on-exit-stop-timeout-or-spawn-error",
+        } } : {}),
         sensitivePathPolicy: effective.sensitivePathPolicy || { mode: "deny", patterns: DEFAULT_SENSITIVE_PATH_PATTERNS },
         executionProfile: preflight,
       },
@@ -561,6 +588,10 @@ export async function prepareAntigravityContainment({
     };
   } catch (error) {
     try { await proxy?.close(); } catch { /* Preserve the original preparation error. */ }
+    try { cleanupTaskScopedAntigravityApproval(approvalProject, { projectsRoot }); } catch (cleanupError) {
+      error.message += `; approval cleanup failed: ${cleanupError.message}`;
+      throw error; // Preserve the owner marker and changed approval for audit.
+    }
     rmSync(taskDirectory, { recursive: true, force: true });
     throw error;
   }
