@@ -11,6 +11,8 @@ const STATUS_LABELS = {
   timed_out: "已超时",
   interrupted: "已中断",
   completed_with_errors: "部分失败",
+  blocked_preflight: "预检阻塞 · 未启动",
+  completed_without_delivery: "执行结束 · 交付缺失",
 };
 
 async function api(path, options = {}) {
@@ -115,7 +117,7 @@ function taskItem(task) {
   const output = task.resultPreviewKind === "error" ? `错误：${task.resultPreview}` : task.resultPreview || task.prompt || "等待结果";
   const action = task.status === "running" || task.status === "queued" ? `<button aria-label="停止任务 ${escapeHtml(task.id)}" data-stop-task="${escapeHtml(task.id)}">停止</button>` : "";
   const agent = state.agents.find((item) => item.agent === task.agent);
-  const followUpLabel = task.status === "running"
+  const followUpLabel = agent?.capabilities?.resume === "unsupported" && !["running", "queued"].includes(task.status) ? "" : task.status === "running"
     ? agent?.capabilities?.follow_up === "supported" ? "实时回复" : ""
     : task.status === "queued" ? "" : agent?.capabilities?.resume === "supported" && task.hasProviderSessionId ? "继续会话" : "新一轮";
   const followUp = followUpLabel ? `<button aria-label="${escapeHtml(followUpLabel)}任务 ${escapeHtml(task.id)}" data-reply-task="${escapeHtml(task.id)}">${escapeHtml(followUpLabel)}</button>` : "";
@@ -131,7 +133,7 @@ function discussionItem(discussion) {
 function renderSummary(statusCounts, discussions) {
   const counts = statusCounts || {};
   const active = Number(counts.queued || 0) + Number(counts.running || 0);
-  const failed = ["failed", "stopped", "timed_out", "interrupted", "completed_with_errors"].reduce((sum, status) => sum + Number(counts[status] || 0), 0);
+  const failed = ["failed", "stopped", "timed_out", "interrupted", "completed_with_errors", "blocked_preflight", "completed_without_delivery"].reduce((sum, status) => sum + Number(counts[status] || 0), 0);
   const total = Object.values(counts).reduce((sum, count) => sum + Number(count || 0), 0);
   $("#running-count").textContent = String(active);
   $("#failed-count").textContent = String(failed);
@@ -221,14 +223,16 @@ async function showTaskDetails(id, { live = false } = {}) {
     ["执行约束", profile.status || policy.status || "未知"],
     ["清理回执", metadata.permissionCleanup?.state || "无清理回执"],
   ].map(([label, value]) => `<p><strong>${escapeHtml(label)}：</strong>${escapeHtml(value)}</p>`).join("");
-  const providerModel = metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || task.model || "未记录";
+  const providerModel = task.agent === "antigravity" ? metadata.providerFacts?.actualModel || "unknown（提供方未报告实际模型）" : metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || task.model || "未记录";
+  const delivery = metadata.deliveryOutcome;
   const output = task.resultText ? `<pre>${escapeHtml(task.resultText)}</pre>` : "暂无完整 Provider 输出。";
   $("#detail-title").textContent = `任务详情 · ${id}`;
   $("#detail-content").innerHTML = `<div class="detail-grid">
-    <section class="detail-section"><h4>执行结果</h4><p><strong>${escapeHtml(statusLabel(task.status))}</strong> · mechanical outcome: ${escapeHtml(outcome.outcome || "未记录")}</p><p>退出码：${escapeHtml(task.exitCode ?? "未知")} · 尝试次数：${escapeHtml(task.attemptNo ?? 1)} · 本轮时限：${escapeHtml(task.timeoutMs / 60000)} 分钟</p><p>创建：${escapeHtml(formatTime(task.createdAt))} · 开始：${escapeHtml(formatTime(task.startedAt))} · 结束：${escapeHtml(formatTime(task.finishedAt))}</p>${outcome.reason ? `<p>机械判定说明：${escapeHtml(outcome.reason)}</p>` : ""}</section>
+    <section class="detail-section"><h4>执行结果</h4><p><strong>${escapeHtml(statusLabel(task.status))}</strong> · mechanical outcome: ${escapeHtml(outcome.outcome || "未记录")}</p><p>交付：${escapeHtml(delivery?.outcome || "历史记录未单独判定")} · 契约：${escapeHtml(metadata.deliveryContract?.type || "未记录")} · 业务/语义验收：not_performed</p>${metadata.preflight ? `<p>提供方未启动：${escapeHtml(metadata.preflight.code)}</p>` : ""}<p>退出码：${escapeHtml(task.exitCode ?? "未知")} · 尝试次数：${escapeHtml(task.attemptNo ?? 1)} · 本轮时限：${escapeHtml(task.timeoutMs / 60000)} 分钟</p><p>创建：${escapeHtml(formatTime(task.createdAt))} · 开始：${escapeHtml(formatTime(task.startedAt))} · 结束：${escapeHtml(formatTime(task.finishedAt))}</p>${outcome.reason ? `<p>机械判定说明：${escapeHtml(outcome.reason)}</p>` : ""}</section>
     <section class="detail-section"><h4>模型与权限</h4><p>Provider 模型：${escapeHtml(providerModel)}</p>${versionValidation ? `<p>WorkBuddy 版本验证：${escapeHtml(versionValidation.status)} · 已验证 ${escapeHtml(versionValidation.validatedProviderVersion || "未知")} · 当前探测 ${escapeHtml(versionValidation.observedProviderVersion || "未探测")}</p>` : ""}${permissionRows}${profile.reason ? `<p>限制：${escapeHtml(profile.reason)}</p>` : ""}</section>
   </div>
   <section class="detail-section"><h4>Provider 最终答复</h4>${finalAnswer?.text ? `<p>来源：Provider 终结事件（${escapeHtml(finalAnswer.eventType)}）。此字段只表示协议标记，不代表内容已被语义验证。</p><pre>${escapeHtml(finalAnswer.text)}</pre>` : `<p>未收到可识别的 Provider 最终答复标记；下面的完整输出可能包含过程信息。</p>`}</section>
+  <section class="detail-section"><h4>交付与恢复边界</h4>${delivery?.evidence?.files ? `<pre>${escapeHtml(JSON.stringify(delivery.evidence.files, null, 2))}</pre>` : ""}<p>任务元数据中的 noMemory/noLocalRead 不等于已强制执行的边界。${escapeHtml(policy.capabilityReport?.externalContainment?.limitation || "")}</p><p>续接能力：${escapeHtml(task.capabilities?.resume || "unknown")}；不支持时请先检查公开事件与受控产物，再明确创建有预算的新任务。不会自动重做。</p></section>
   <section class="detail-section"><h4>完整 Provider 输出（可能包含过程日志）</h4>${output}</section>
   <section class="detail-section"><h4>错误与限制</h4>${errors.length ? errors.map((error) => `<p>${escapeHtml(error)}</p>`).join("") : "<p>没有记录到错误。</p>"}</section>
   <details class="detail-section"><summary>执行时间线（${eventHistory.events.length} 条${eventHistory.incomplete ? "，当前页未完整" : ""}）</summary><div class="event-timeline">${events || "<p>没有事件。</p>"}</div></details>`;

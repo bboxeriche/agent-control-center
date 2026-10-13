@@ -40,7 +40,7 @@
         <div class="task-filters">
           <label for="task-search">搜索任务指令</label><input id="task-search" type="search" maxlength="120" placeholder="输入任务关键词" />
           <label for="task-agent-filter">Agent</label><select id="task-agent-filter"><option value="">全部 Agent</option></select>
-          <label for="task-status-filter">状态</label><select id="task-status-filter"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">进行中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="stopped">已停止</option><option value="timed_out">已超时</option><option value="interrupted">已中断</option><option value="completed_with_errors">部分失败</option></select>
+          <label for="task-status-filter">状态</label><select id="task-status-filter"><option value="">全部状态</option><option value="queued">排队中</option><option value="running">进行中</option><option value="succeeded">已完成</option><option value="failed">失败</option><option value="stopped">已停止</option><option value="timed_out">已超时</option><option value="interrupted">已中断</option><option value="completed_with_errors">部分失败</option><option value="blocked_preflight">预检阻塞 · 未启动</option><option value="completed_without_delivery">执行结束 · 交付缺失</option></select>
         </div>
         <div class="item-list" id="task-list"><p class="muted">暂无任务</p></div>
         <button class="quiet-button load-more" id="task-load-more" type="button" hidden>加载更多</button>

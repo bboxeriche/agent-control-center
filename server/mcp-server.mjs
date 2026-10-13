@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import { DEFAULT_HOST, DEFAULT_PORT, MAX_TASK_TIMEOUT_MS, SERVICE_VERSION, SUPPORTED_ORIGINS, loadConfig, readAuthToken, resolveDataDir } from "./core.mjs";
+import { DELIVERY_CONTRACT_SCHEMA } from "./delivery.mjs";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const servicePath = fileURLToPath(new URL("./service.mjs", import.meta.url));
@@ -90,6 +91,7 @@ const tools = [
         cwd: { type: "string", description: "Absolute repository working directory." },
         model: { type: "string", description: "Provider-specific model identifier passed literally to --model; examples on this host are gpt-5.6-luna, hy4-preview, or gemini-3.8-flash-high." },
         timeoutMs: { type: "integer", minimum: 1000, maximum: MAX_TASK_TIMEOUT_MS, description: "Per-attempt budget; defaults to the service's 60-minute budget unless configured otherwise. Explicit shorter budgets are preserved." },
+        deliveryContract: DELIVERY_CONTRACT_SCHEMA,
         origin: { type: "string", enum: SUPPORTED_ORIGINS },
         originRequestId: { type: "string" },
         idempotencyKey: { type: "string" },

@@ -4,6 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { extname, join, resolve } from "node:path";
 import { adapterFor, healthFor } from "./adapters.mjs";
+import { FinalAnswerCollector, normalizeDeliveryContract, snapshotDeliveryFiles, assessDelivery, recoverySummary } from "./delivery.mjs";
 import {
   antigravityCapabilityReport,
   preflightAntigravityExecutionProfile,
@@ -138,12 +139,13 @@ function discussionAgentNames(config, requested) {
   return unique;
 }
 
-function terminalStatusForResult(result, runtime, mechanicalOutcome = null) {
+function terminalStatusForResult(result, runtime, mechanicalOutcome = null, deliveryOutcome = null) {
   if (runtime.stopRequested) return "stopped";
   if (runtime.timedOut) return "timed_out";
   if (result?.stopRequested) return "stopped";
   if (mechanicalOutcome?.outcome === "failed") return "failed";
   if (result?.error || result?.exitCode !== 0) return "failed";
+  if (deliveryOutcome?.outcome?.startsWith("missing_")) return "completed_without_delivery";
   return "succeeded";
 }
 
@@ -151,22 +153,6 @@ function safeResultText(runtime, result) {
   const streamed = runtime.textParts.filter(Boolean).join("\n").trim();
   if (streamed) return truncate(redactSecrets(streamed), 60000);
   return truncate(redactSecrets(result?.stdout || ""), 60000);
-}
-
-function recognizedFinalAnswer(agent, value) {
-  let text = "";
-  let eventType = "";
-  if (value?.type === "result" && typeof value.result === "string" && value.result.trim()) {
-    text = value.result;
-    eventType = "result";
-  } else if (agent === "antigravity" && value?.event === "result" && value.result?.status === "SUCCESS" && typeof value.result.response === "string") {
-    text = value.result.response;
-    eventType = "result/response";
-  } else if (agent === "codex-cli" && value?.type === "item.completed" && value.item?.type === "agent_message" && typeof value.item.text === "string") {
-    text = value.item.text;
-    eventType = "item.completed/agent_message";
-  }
-  return text.trim() ? { source: "provider_final_event", eventType, text: truncate(redactSecrets(text.trim()), 60000) } : null;
 }
 
 function taskResultSummary(task) {
@@ -180,6 +166,12 @@ function taskResultSummary(task) {
   return {
     taskId: task.id,
     status: task.status,
+    deliveryOutcome: metadata.deliveryOutcome || { outcome: "not_recorded", code: null },
+    deliveryContract: metadata.deliveryContract || null,
+    semanticVerification: "not_performed",
+    preflight: metadata.preflight || null,
+    recovery: recoverySummary(task),
+    executionIdentity: metadata.executionIdentity || { actualModel: metadata.providerFacts?.actualModel || null, status: metadata.providerFacts?.actualModel ? "provider_reported" : "unknown", requestedModel: task.model || null },
     mechanicalOutcome: metadata.mechanicalOutcome ? {
       outcome: metadata.mechanicalOutcome.outcome || "unknown",
       code: metadata.mechanicalOutcome.code || null,
@@ -190,10 +182,11 @@ function taskResultSummary(task) {
       eventType: finalAnswer.eventType || null,
       preview: truncate(answerText, 1200),
       truncated: answerText.length > 1200,
+      evidence: finalAnswer.evidence || null,
       semanticVerification: "not_performed",
     } : null,
     providerOutputAvailable: Boolean(task.resultText),
-    providerModel: metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || task.model || null,
+    providerModel: task.agent === "antigravity" ? metadata.providerFacts?.actualModel || null : metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || task.model || null,
     errors: {
       controlPlane: task.errorText ? truncate(redactSecrets(task.errorText), 4000) : null,
       providerStructured: metadata.providerFacts?.structuredToolErrors || [],
@@ -214,6 +207,7 @@ function taskResultSummary(task) {
         providerVersionValidation: profile.providerVersionValidation || policy.capabilityReport?.providerVersionValidation || null,
       },
       limitations,
+      enforcementLayers: { native: policy.capabilityReport?.native || null, external: policy.capabilityReport?.externalContainment || null, taskMetadata: "advisory-only; metadata such as noMemory/noLocalRead is not an enforced boundary" },
     },
     permissionCleanup: metadata.permissionCleanup ? {
       state: metadata.permissionCleanup.state || "unknown",
@@ -337,6 +331,7 @@ export class ControlPlane {
       timeoutMs,
       origin,
       permissionPolicy: permissionPolicy.effective,
+      deliveryContract: (input.deliveryContract ?? input.metadata?.deliveryContract) === undefined ? undefined : normalizeDeliveryContract(input.deliveryContract ?? input.metadata?.deliveryContract, { agent: input.agent, cwd, permissionPolicy }),
     });
     if (idempotencyKey) {
       const existing = this.store.getTaskByIdempotencyKey(idempotencyKey);
@@ -366,6 +361,9 @@ export class ControlPlane {
         providerSessionId: input.sessionId || input.providerSessionId,
         metadata: {
           ...(input.metadata || {}),
+          deliveryContract: normalizeDeliveryContract(input.deliveryContract ?? input.metadata?.deliveryContract, { agent: input.agent, cwd, permissionPolicy }),
+          deliveryOutcome: null,
+          semanticVerification: "not_performed",
           ...(providerModel ? { providerModel } : {}),
         },
       });
@@ -394,9 +392,26 @@ export class ControlPlane {
         executionProfile: task.permissionPolicy.executionProfile || null,
       },
     });
+    if (task.agent === "antigravity" && task.permissionPolicy.executionProfile?.status === "UNSUPPORTED") {
+      return { task: this.blockTaskPreflight(task), reused: false };
+    }
     this.queue.push(task.id);
     this.pump();
     return { task: this.getTask(task.id), reused: false };
+  }
+
+  blockTaskPreflight(task) {
+    const profile = task.permissionPolicy.executionProfile;
+    const preflight = { status: "blocked_preflight", code: profile.code, reason: profile.reason, providerStarted: false };
+    const mechanicalOutcome = { outcome: "not_started", code: "blocked_preflight", reason: profile.reason, evidence: { providerStarted: false } };
+    const deliveryOutcome = { outcome: "not_evaluated", code: "blocked_preflight", contract: task.metadata?.deliveryContract || null, semanticVerification: "not_performed" };
+    const blocked = this.store.updateTask(task.id, {
+      status: "blocked_preflight", finishedAt: nowIso(), errorText: `${profile.code}: ${profile.reason}`,
+      metadata: { ...task.metadata, preflight, mechanicalOutcome, deliveryOutcome, semanticVerification: "not_performed", providerFacts: emptyProviderFacts(), providerFinalAnswer: null },
+    });
+    this.emit({ taskId: task.id, eventType: "task_preflight_blocked", source: "control-plane", payload: preflight });
+    this.emit({ taskId: task.id, eventType: "task_finished", source: "control-plane", payload: { taskId: task.id, status: blocked.status, error: blocked.errorText, preflight, mechanicalOutcome, deliveryOutcome, semanticVerification: "not_performed", executionProfile: profile } });
+    return this.getTask(task.id);
   }
 
   pump() {
@@ -435,6 +450,10 @@ export class ControlPlane {
   async runTask(taskId) {
     const task = this.store.getTask(taskId);
     if (!task) return;
+    if (task.agent === "antigravity" && task.permissionPolicy.executionProfile?.status === "UNSUPPORTED") return this.blockTaskPreflight(task);
+    const finalAnswers = new FinalAnswerCollector(task.agent);
+    const deliveryContract = task.metadata?.deliveryContract || { type: task.agent === "antigravity" ? "final_answer" : "execution_only" };
+    const deliveryBefore = snapshotDeliveryFiles(deliveryContract, task.permissionPolicy);
     const runtime = {
       textParts: [],
       providerFinalAnswer: null,
@@ -481,15 +500,15 @@ export class ControlPlane {
           this.store.updateTask(taskId, { providerSessionId: sessionId });
         }
         if (event.text && !["provider_error", "stderr"].includes(event.type)) runtime.textParts.push(event.text);
-        const finalAnswer = recognizedFinalAnswer(task.agent, event.payload?.json);
-        if (finalAnswer) runtime.providerFinalAnswer = finalAnswer;
-        this.emit({
+        const persistedEvent = this.emit({
           taskId,
           eventType: event.type || "provider_message",
           source: task.agent,
           stream: event.stream,
           payload: event.payload || { text: event.text },
         });
+        finalAnswers.observe(event.payload?.json, { eventId: persistedEvent.id, stream: event.stream || "stdout" });
+        runtime.providerFinalAnswer = finalAnswers.answer;
       });
       runtime.handle = handle;
       if (handle.providerSessionId) runtime.providerSessionId = handle.providerSessionId;
@@ -571,7 +590,8 @@ export class ControlPlane {
       timedOut: runtime.timedOut,
       containmentError: result?.containmentError || null,
     });
-    const finalStatus = terminalStatusForResult(result, runtime, mechanicalOutcome);
+    const deliveryOutcome = assessDelivery({ contract: deliveryContract, finalAnswer: runtime.providerFinalAnswer, mechanicalOutcome, before: deliveryBefore, files: snapshotDeliveryFiles(deliveryContract, task.permissionPolicy) });
+    const finalStatus = terminalStatusForResult(result, runtime, mechanicalOutcome, deliveryOutcome);
     const errorText = runtime.timedOut
       ? "task timed out"
       : result?.error
@@ -582,6 +602,9 @@ export class ControlPlane {
       mechanicalOutcome,
       providerFacts,
       providerFinalAnswer: runtime.providerFinalAnswer,
+      deliveryOutcome,
+      semanticVerification: "not_performed",
+      executionIdentity: { actualModel: providerFacts?.actualModel || null, status: providerFacts?.actualModel ? "provider_reported" : "unknown", requestedModel: task.model || null },
       permissionCleanup: result?.permissionCleanup || null,
     };
     if (task.agent === "tencent-workbuddy") {
@@ -619,6 +642,8 @@ export class ControlPlane {
         permissionCleanup: result?.permissionCleanup || null,
         mechanicalOutcome,
         providerFacts,
+        deliveryOutcome,
+        semanticVerification: "not_performed",
         executionProfile: task.permissionPolicy.executionProfile || null,
       },
     });
@@ -639,7 +664,7 @@ export class ControlPlane {
     const normalizedAgent = String(agent || "").trim();
     if (normalizedAgent && !this.config.agents[normalizedAgent]) throw statusError(400, "unknown agent filter");
     const normalizedStatus = String(status || "").trim();
-    const allowedStatuses = new Set(["queued", "running", "succeeded", "failed", "stopped", "timed_out", "interrupted", "completed_with_errors"]);
+    const allowedStatuses = new Set(["queued", "running", "succeeded", "failed", "stopped", "timed_out", "interrupted", "completed_with_errors", "blocked_preflight", "completed_without_delivery"]);
     if (normalizedStatus && !allowedStatuses.has(normalizedStatus)) throw statusError(400, "invalid task status filter");
     const normalizedCursor = String(cursor || "").trim();
     if (normalizedCursor.length > 200) throw statusError(400, "invalid task page cursor");
@@ -792,6 +817,11 @@ export class ControlPlane {
     }
     const priorRun = this.runningPromises.get(id);
     if (priorRun) await Promise.allSettled([priorRun]);
+    if (task.capabilities?.resume === "unsupported") {
+      const error = statusError(409, "provider_resume_unsupported: inspect public events/artifacts and explicitly create a new bounded task; no automatic retry was performed");
+      error.recovery = recoverySummary(task);
+      throw error;
+    }
     const nextAttemptNo = Number(task.attemptNo || 1) + 1;
     const resumed = this.store.updateTask(id, {
       status: "queued",
@@ -814,6 +844,9 @@ export class ControlPlane {
         mechanicalOutcome: null,
         providerFacts: null,
         providerFinalAnswer: null,
+        deliveryOutcome: null,
+        executionIdentity: null,
+        preflight: null,
         permissionCleanup: null,
       },
     });
@@ -936,7 +969,9 @@ export class ControlPlane {
             agent: task.agent,
             roundNo,
             role: "response",
-            text: task.resultText || task.errorText || `[${task.status}] no response recorded`,
+            text: task.metadata?.deliveryContract?.type === "final_answer"
+              ? task.metadata.providerFinalAnswer?.text || task.errorText || `[${task.status}] required final answer was not delivered; process logs are not a report`
+              : task.resultText || task.errorText || `[${task.status}] no response recorded`,
           });
         }
         this.emit({ discussionId: id, eventType: "discussion_round_finished", source: "control-plane", payload: { discussionId: id, roundNo, taskIds } });
@@ -1210,7 +1245,7 @@ function jsonResponse(response, status, payload) {
 
 function sendError(response, error) {
   const status = Number(error.statusCode) || 400;
-  jsonResponse(response, status, { error: error.message || String(error) });
+  jsonResponse(response, status, { error: error.message || String(error), ...(error.recovery ? { recovery: error.recovery } : {}) });
 }
 
 async function readJsonBody(request, maxBytes = 2_000_000) {
@@ -1374,7 +1409,7 @@ export function createRequestHandler(plane) {
       if (request.method === "GET" && path === "/api/tasks") return jsonResponse(response, 200, { tasks: plane.listTasks(url.searchParams.get("limit")) });
       if (request.method === "POST" && path === "/api/tasks") {
         const outcome = plane.createTaskRequest(requestInput(request, await readJsonBody(request), { dashboardSession }));
-        return jsonResponse(response, 202, { ...outcome, resultSummary: taskResultSummary(outcome.task) });
+        return jsonResponse(response, outcome.task.status === "blocked_preflight" ? 200 : 202, { ...outcome, resultSummary: taskResultSummary(outcome.task) });
       }
       if (request.method === "GET" && path === "/api/discussions") return jsonResponse(response, 200, { discussions: plane.listDiscussions(url.searchParams.get("limit")) });
       if (request.method === "POST" && path === "/api/discussions") {

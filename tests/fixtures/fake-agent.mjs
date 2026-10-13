@@ -15,5 +15,6 @@ setTimeout(() => {
   process.stdout.write(`${JSON.stringify({ type: "assistant", text: `Recommendation: complete the request for ${prompt}` })}\n`);
   process.stdout.write(`${JSON.stringify({ type: "assistant", text: "Risks: verify the result on the target repository" })}\n`);
   process.stdout.write(`${JSON.stringify({ type: "assistant", text: "Next steps: run the focused checks" })}\n`);
+  if (sessionId.endsWith("antigravity")) process.stdout.write(`${JSON.stringify({ event: "result", result: { status: "SUCCESS", response: `Recommendation: complete the request for ${prompt}\nRisks: verify the result on the target repository\nNext steps: run the focused checks` } })}\n`);
   process.exit(0);
 }, delayMs);

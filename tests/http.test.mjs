@@ -14,7 +14,7 @@ function fakeConfig() {
   config.maxConcurrentTasks = 2;
   config.defaultTimeoutMs = 5000;
   for (const agent of Object.keys(config.agents)) {
-    config.agents[agent] = { ...config.agents[agent], command: process.execPath, args: [fixture, "-p", "{prompt}"], env: { ...process.env } };
+    config.agents[agent] = { ...config.agents[agent], command: process.execPath, args: [fixture, "-p", "{prompt}"], env: { ...process.env, FAKE_AGENT_SESSION: `session-${agent}` } };
   }
   config.agents.antigravity.permissionMapping = { strategy: "test-double" };
   return config;
@@ -26,7 +26,7 @@ async function waitForTask(baseUrl, taskId, authToken) {
       headers: { authorization: `Bearer ${authToken}` },
     });
     const payload = await response.json();
-    if (["succeeded", "failed", "stopped", "timed_out", "interrupted"].includes(payload.task.status)) return payload.task;
+    if (["succeeded", "failed", "stopped", "timed_out", "interrupted", "blocked_preflight", "completed_without_delivery"].includes(payload.task.status)) return payload.task;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error("HTTP task timed out");

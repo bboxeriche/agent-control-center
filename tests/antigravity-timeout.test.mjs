@@ -77,6 +77,7 @@ test("passes task timeout through ControlPlane to the Antigravity adapter", asyn
       prompt: "timeout forwarding smoke",
       cwd: process.cwd(),
       timeoutMs: 10_000,
+      deliveryContract: { type: "execution_only" },
     });
     const finished = await plane.waitForTask(task.id, 5000);
     assert.equal(finished.status, "succeeded");

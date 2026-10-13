@@ -109,6 +109,27 @@ async function dashboard(count = 65) {
   return { element, doc, win, streams, calls, tasks, events, controls, evaluate, settle, flushActivity, intervals };
 }
 
+test("Dashboard distinguishes missing delivery/preflight and never labels configured Anti model as actual", async () => {
+  const ui = await dashboard(2);
+  ui.tasks[0].status = "completed_without_delivery";
+  ui.tasks[0].agent = "antigravity";
+  ui.tasks[0].model = "configured-only";
+  ui.tasks[0].capabilities = { resume: "unsupported" };
+  ui.tasks[0].metadata = { mechanicalOutcome: { outcome: "succeeded" }, deliveryContract: { type: "final_answer" }, deliveryOutcome: { outcome: "missing_required_final_answer" }, providerFacts: { actualModel: null } };
+  ui.tasks[1].status = "blocked_preflight";
+  ui.evaluate('state.agents.push({agent:"antigravity",capabilities:{resume:"unsupported"}})');
+  const card = ui.evaluate(`taskItem(${JSON.stringify(ui.tasks[0])})`);
+  assert.match(card, /执行结束 · 交付缺失/);
+  assert.doesNotMatch(card, /data-reply-task/);
+  await ui.evaluate(`showTaskDetails(${JSON.stringify(ui.tasks[0].id)})`);
+  const detail = ui.element("#detail-content").innerHTML;
+  assert.match(detail, /missing_required_final_answer/);
+  assert.match(detail, /not_performed/);
+  assert.match(detail, /unknown（提供方未报告实际模型）/);
+  assert.doesNotMatch(detail, /configured-only/);
+  assert.match(ui.evaluate(`taskItem(${JSON.stringify(ui.tasks[1])})`), /预检阻塞 · 未启动/);
+});
+
 test("Dashboard refresh replaces all loaded pages and drops tasks no longer matching the status filter", async () => {
   const ui = await dashboard(145);
   for (let i = 0; i < 4; i++) await ui.element("#task-load-more").emit("click");

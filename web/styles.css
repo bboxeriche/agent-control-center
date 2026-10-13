@@ -113,6 +113,7 @@ fieldset { min-width: 0; margin: 0; border: 1px solid var(--line); border-radius
 .status { min-width: 52px; color: var(--muted); font-size: 12px; font-weight: 650; white-space: nowrap; }
 .status-succeeded { color: var(--green); }
 .status-running, .status-queued { color: var(--yellow); }
+.status-completed_without_delivery, .status-blocked_preflight { color: var(--yellow); }
 .status-failed, .status-stopped, .status-timed_out, .status-interrupted, .status-completed_with_errors { color: var(--red); }
 
 .empty-state { display: grid; gap: 4px; padding: 24px 8px 8px; color: var(--muted); }

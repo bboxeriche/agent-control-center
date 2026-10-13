@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
+import { StringDecoder } from "node:string_decoder";
 import { prepareAntigravityContainment, ANTIGRAVITY_CONTAINMENT_STRATEGY } from "./antigravity-containment.mjs";
 import { prepareWorkBuddyContainment } from "./workbuddy-containment.mjs";
 import {
@@ -26,11 +27,12 @@ import {
   truncate,
 } from "./core.mjs";
 
-function lineDecoder(onLine) {
+export function lineDecoder(onLine) {
+  const decoder = new StringDecoder("utf8");
   let buffer = "";
   return {
     push(chunk) {
-      buffer += chunk.toString("utf8");
+      buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
       let index;
       while ((index = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, index).replace(/\r$/, "");
@@ -39,6 +41,7 @@ function lineDecoder(onLine) {
       }
     },
     flush() {
+      buffer += decoder.end();
       const line = buffer.replace(/\r$/, "");
       buffer = "";
       if (line) onLine(line);

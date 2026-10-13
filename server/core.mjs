@@ -18,6 +18,8 @@ export const DEFAULT_PORT = 47770;
 export const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1000;
 export const MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 export const TERMINAL_TASK_STATUSES = new Set([
+  "blocked_preflight",
+  "completed_without_delivery",
   "succeeded",
   "failed",
   "stopped",
@@ -428,6 +430,7 @@ export function idempotencyFingerprint(input) {
     timeoutMs: input.timeoutMs,
     origin: input.origin,
     permissionPolicy: input.permissionPolicy || {},
+    ...(input.deliveryContract ? { deliveryContract: input.deliveryContract } : {}),
   });
 }
 
@@ -734,6 +737,7 @@ export function extractSessionId(value) {
 
 export function emptyProviderFacts() {
   return {
+    terminalStatus: null,
     status: null,
     statuses: [],
     deniedActions: [],
@@ -770,6 +774,16 @@ export function collectProviderFacts(value, facts = emptyProviderFacts(), depth 
     return facts;
   }
   if (typeof value !== "object") return facts;
+
+  if (depth === 0) {
+    const terminal = value.event === "result" ? value.result : value.type === "result" ? value : null;
+    if (typeof terminal?.status === "string") facts.terminalStatus = terminal.status;
+    // Only explicit provider-envelope evidence, never a configured default or
+    // a model-looking string inside a tool payload, establishes actual identity.
+    const identity = value.event === "init" ? value.init : terminal;
+    const actualModel = identity?.actual_model || identity?.actualModel;
+    if (typeof actualModel === "string" && actualModel.trim()) facts.actualModel = boundedFactText(actualModel, 200);
+  }
 
   for (const key of ["status", "state", "subtype"]) {
     const candidate = value[key];
@@ -827,6 +841,7 @@ export function classifyMechanicalOutcome({
   };
   const cleanup = result?.permissionCleanup || null;
   const evidence = {
+    terminalStatus: facts.terminalStatus || null,
     providerStatus: facts.status || null,
     providerStatuses: facts.statuses,
     exitCode: result?.exitCode ?? null,
@@ -858,7 +873,7 @@ export function classifyMechanicalOutcome({
     return { outcome: "failed", code: "provider_exit_nonzero", reason: `provider exited with code ${result.exitCode}`, evidence };
   }
   if (result?.error) return { outcome: "failed", code: "provider_error", reason: boundedFactText(result.error), evidence };
-  const successStatus = facts.statuses.find((status) => MECHANICAL_SUCCESS_STATUSES.has(String(status).toLowerCase())) || null;
+  const successStatus = MECHANICAL_SUCCESS_STATUSES.has(String(facts.terminalStatus).toLowerCase()) ? facts.terminalStatus : null;
   return { outcome: "succeeded", code: "mechanical_success", reason: successStatus ? `provider reported status ${successStatus}` : "provider exited cleanly", evidence };
 }
 

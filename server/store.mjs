@@ -333,7 +333,7 @@ export class Store {
     const pageWhere = pageClauses.length ? ` WHERE ${pageClauses.join(" AND ")}` : "";
     const rows = this.db.prepare(`
       SELECT id, agent, prompt, cwd, status, created_at, started_at, finished_at, timeout_ms,
-        provider_session_id, attempt_no, result_text, error_text
+        provider_session_id, attempt_no, result_text, error_text, metadata_json
       FROM tasks${pageWhere}
       ORDER BY created_at DESC, id DESC
       LIMIT ?
@@ -352,6 +352,8 @@ export class Store {
       hasProviderSessionId: Boolean(row.provider_session_id),
       timeoutMs: row.timeout_ms,
       attemptNo: row.attempt_no ?? 1,
+      deliveryOutcome: parseJson(row.metadata_json, {}).deliveryOutcome || null,
+      mechanicalOutcome: parseJson(row.metadata_json, {}).mechanicalOutcome?.outcome || null,
       resultPreview: truncate(redactSecrets(row.error_text || row.result_text || ""), 240),
       resultPreviewKind: row.error_text ? "error" : row.result_text ? "provider_output" : "none",
     }));
@@ -376,7 +378,9 @@ export class Store {
       exitCode: row.exit_code,
       errorText: row.error_text,
       mechanicalOutcome: metadata.mechanicalOutcome?.outcome || null,
-      providerModel: metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || row.model || null,
+      providerModel: agent === "antigravity" ? metadata.providerFacts?.actualModel || null : metadata.providerModel?.actualModel || metadata.providerModel?.resolvedModel || row.model || null,
+      actualModelStatus: metadata.providerFacts?.actualModel ? "provider_reported" : "unknown",
+      deliveryOutcome: metadata.deliveryOutcome?.outcome || "not_recorded",
       permissionCleanup: metadata.permissionCleanup?.state || null,
     };
   }

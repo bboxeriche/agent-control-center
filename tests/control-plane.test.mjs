@@ -220,10 +220,11 @@ test("stores a separate final-answer evidence field only for a recognized provid
     const task = plane.createTask({ agent: "claude-code", prompt: "run final event probe", cwd: process.cwd() });
     const finished = await plane.waitForTask(task.id, 5000);
     assert.equal(finished.status, "succeeded");
-    assert.deepEqual(finished.metadata.providerFinalAnswer, {
+    assert.deepEqual({ ...finished.metadata.providerFinalAnswer, evidence: undefined }, {
       source: "provider_final_event",
       eventType: "result",
       text: "Provider final answer",
+      evidence: undefined,
     });
     assert.match(finished.resultText, /Provider final answer/);
   } finally {
@@ -234,7 +235,7 @@ test("stores a separate final-answer evidence field only for a recognized provid
 test("recognizes Antigravity's nested successful final response without promoting progress or failed partial output", async () => {
   const cases = [
     { event: { event: "result", result: { status: "SUCCESS", response: "ACC Anti final answer\n" } }, expected: "ACC Anti final answer", status: "succeeded" },
-    { event: { event: "step_update", step_update: { state: "DONE", step_type: "agent_response", text_delta: "progress only" } }, expected: null, status: "succeeded" },
+    { event: { event: "step_update", step_update: { state: "DONE", step_type: "agent_response", text_delta: "progress only" } }, expected: null, status: "completed_without_delivery" },
     { event: { event: "result", result: { status: "ERROR", response: "partial output", error: "interrupted" } }, expected: null, status: "failed" },
   ];
   for (const { event, expected, status } of cases) {
@@ -247,7 +248,7 @@ test("recognizes Antigravity's nested successful final response without promotin
       const finished = await plane.waitForTask(task.id, 5000);
       assert.equal(finished.status, status);
       if (expected) {
-        assert.deepEqual(finished.metadata.providerFinalAnswer, { source: "provider_final_event", eventType: "result/response", text: expected });
+        assert.deepEqual({ ...finished.metadata.providerFinalAnswer, evidence: undefined }, { source: "provider_final_event", eventType: "result/response", text: expected, evidence: undefined });
       } else {
         assert.equal(finished.metadata.providerFinalAnswer, null);
       }

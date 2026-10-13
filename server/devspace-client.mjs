@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import { DEFAULT_HOST, DEFAULT_PORT, MAX_TASK_TIMEOUT_MS, loadConfig, readAuthToken, resolveDataDir } from "./core.mjs";
+import { DELIVERY_CONTRACT_SCHEMA } from "./delivery.mjs";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const servicePath = fileURLToPath(new URL("./service.mjs", import.meta.url));
@@ -37,6 +38,7 @@ export const DEVSPACE_TOOLS = [
         cwd: { type: "string", description: "Absolute repository working directory inside ACC allowed roots." },
         model: { type: "string" },
         timeoutMs: { type: "integer", minimum: 1000, maximum: MAX_TASK_TIMEOUT_MS, description: "Per-attempt budget; omit to use the service default (60 minutes unless configured otherwise). Explicit shorter budgets are preserved." },
+        deliveryContract: DELIVERY_CONTRACT_SCHEMA,
         originRequestId: { type: "string" },
         idempotencyKey: { type: "string", description: "Stable key for retrying this exact create request." },
         permissionPolicy: { type: "object", additionalProperties: false },
@@ -140,6 +142,7 @@ export function createDevSpaceClient({
     if (!response.ok) {
       const error = new Error(safeErrorMessage(payload, response.status, authToken));
       error.statusCode = response.status;
+      if (payload.recovery) error.recovery = payload.recovery;
       throw error;
     }
     return payload;
