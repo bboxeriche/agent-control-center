@@ -68,8 +68,14 @@ function profileRule(operation, kind, path) {
   return `(allow ${operation} (${kind} ${quoteProfileValue(path)}))`;
 }
 
-function profileRegexRule(operation, pattern) {
-  return `(deny ${operation} (regex #"${String(pattern).replaceAll("\"", "\\\"")}"))`;
+function profileRegexRule(operation, pattern, excludedPaths = []) {
+  const match = `(regex #"${String(pattern).replaceAll("\"", "\\\"")}")`;
+  // Seatbelt's regex dialect does not implement negative lookahead. Such a
+  // pattern can silently stop denying ALL PEM/key files, not just the CA.
+  const filter = excludedPaths.length
+    ? `(require-all ${match} (require-not (require-any ${excludedPaths.map(path => `(literal ${quoteProfileValue(path)})`).join(" ")})))`
+    : match;
+  return `(deny ${operation} ${filter})`;
 }
 
 function exactHost(value) {
@@ -151,6 +157,7 @@ export function buildSandboxProfile({
   runtimeRoot = join(homedir(), ".gemini", "antigravity-cli"),
   command,
   taskRoot,
+  temporaryDirectory,
   sensitivePathPolicy = { mode: "deny", patterns: DEFAULT_SENSITIVE_PATH_PATTERNS },
 } = {}) {
   const scopes = canonicalScope(filesystemScope);
@@ -168,6 +175,7 @@ export function buildSandboxProfile({
     ...(writeAllowed ? scopes.map((scope) => profileRule("file-write*", "subpath", scope)) : []),
     ...runtime.directories.map((path) => profileRule("file-write*", "subpath", path)),
     ...runtime.literals.map((path) => profileRule("file-write*", "literal", path)),
+    ...(temporaryDirectory ? [profileRule("file-write*", "subpath", resolve(temporaryDirectory))] : []),
     profileRule("file-write*", "literal", "/dev/null"),
     // agy's run_command allocates a nested PTY inside this sandbox. Grant the
     // PTY operation, its literal master device, and only extension-authorized
@@ -190,10 +198,9 @@ export function buildSandboxProfile({
       ? sensitivePathPolicy.patterns
       : DEFAULT_SENSITIVE_PATH_PATTERNS;
     for (const pattern of patterns) {
-      const sandboxPattern = allowSystemCaBundle && String(pattern) === ".*\\.(pem|key)$"
-        ? "(?!/etc/ssl/cert\\.pem$).*\\.(pem|key)$"
-        : pattern;
-      lines.push(profileRegexRule("file-read*", sandboxPattern));
+      const excludedPaths = allowSystemCaBundle && String(pattern) === ".*\\.(pem|key)$"
+        ? ["/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem"] : [];
+      lines.push(profileRegexRule("file-read*", pattern, excludedPaths));
       lines.push(profileRegexRule("file-write*", pattern));
     }
     if (allowSystemCaBundle) {
@@ -513,6 +520,7 @@ export async function prepareAntigravityContainment({
       filesystemScope: scopes,
       writeAllowed: effective.writeAllowed === true,
       networkProxyPort: proxy.port,
+      allowSystemCaBundle: true,
       runtimeRoot: config.runtimeRoot,
       command,
       taskRoot: taskDirectory,
@@ -554,6 +562,13 @@ export async function prepareAntigravityContainment({
       },
       env: {
         TMPDIR: taskDirectory,
+        TMPPREFIX: join(taskDirectory, "zsh"),
+        // Use the public system trust bundle rather than a credential-shaped
+        // Python certifi path. Never disable TLS verification or trust a CA
+        // supplied by the task's prompt/environment.
+        SSL_CERT_FILE: "/etc/ssl/cert.pem",
+        REQUESTS_CA_BUNDLE: "/etc/ssl/cert.pem",
+        CURL_CA_BUNDLE: "/etc/ssl/cert.pem",
         GIT_OPTIONAL_LOCKS: "0",
         HTTP_PROXY: `http://127.0.0.1:${proxy.port}`,
         HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`,
@@ -573,6 +588,8 @@ export async function prepareAntigravityContainment({
         providerHosts,
         externalNetwork: effective.networkAllowed === true ? "allowlisted-proxy-wildcard" : "provider-hosts-only",
         persistentSettingsMutation: false,
+        runtimeTemporaryDirectory: taskDirectory,
+        publicCaBundle: "/etc/ssl/cert.pem",
         ...(approvalProject ? { headlessApproval: {
           strategy: approvalMode === "skip-permissions" ? "task-scoped-project-denies-with-skip-permissions" : "task-scoped-project-grants",
           approvalMode,

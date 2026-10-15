@@ -207,6 +207,8 @@ export function workBuddyModelReport(config = {}, { requestedModel = null, actua
   return {
     providerVersion: config.providerVersion || WORKBUDDY_VERSION,
     defaultModel: config.defaultModel || WORKBUDDY_DEFAULT_MODEL,
+    fallbackModel: config.fallbackModel || null,
+    fallbackPolicy: config.fallbackModel ? "provider-native-overload-only-same-attempt-budget" : "disabled",
     validatedModels: [...(config.validatedModels || WORKBUDDY_VALIDATED_MODELS)],
     requestedModel: requestedModel || null,
     actualModel: actualModel || null,

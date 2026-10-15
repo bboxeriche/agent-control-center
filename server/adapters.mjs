@@ -20,6 +20,7 @@ import {
 import {
   capabilitiesFor,
   collectProviderFacts,
+  collectProviderDiagnosticLine,
   emptyProviderFacts,
   fillTemplateArgs,
   parseProviderLine,
@@ -49,7 +50,7 @@ export function lineDecoder(onLine) {
   };
 }
 
-function commandArgs(config, spec) {
+export function commandArgs(config, spec) {
   const values = {
     prompt: spec.prompt,
     cwd: spec.cwd,
@@ -81,6 +82,12 @@ function commandArgs(config, spec) {
   }
   if (spec.model && config.modelArgs?.length) {
     args.push(...fillTemplateArgs(config.modelArgs, values));
+  }
+  // Explicit operator opt-in to the CLI's in-attempt overload fallback. This
+  // does not create a new task, widen permission, or reset the ACC watchdog.
+  if (permissionMapping?.strategy === WORKBUDDY_CONTAINMENT_STRATEGY && config.fallbackModel
+    && config.fallbackModel !== spec.model && !args.includes("--fallback-model")) {
+    args.push("--fallback-model", config.fallbackModel);
   }
   return args;
 }
@@ -314,7 +321,7 @@ function collectWorkBuddyProviderFacts(value, facts, toolUses = new Map(), depth
   return facts;
 }
 
-async function probeCommand(command, versionArgs = ["--version"]) {
+async function probeCommand(command, versionArgs = ["--version"], { label = "version", requiredOptions = [] } = {}) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
     let settled = false;
@@ -333,13 +340,13 @@ async function probeCommand(command, versionArgs = ["--version"]) {
     }
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      finish({ available: false, error: "version probe timed out" });
+      finish({ available: false, error: `${label} probe timed out` });
     }, 3000);
     child.stdout.on("data", (chunk) => {
-      output += chunk.toString("utf8");
+      output = (output + chunk.toString("utf8")).slice(0, 262144);
     });
     child.stderr.on("data", (chunk) => {
-      output += chunk.toString("utf8");
+      output = (output + chunk.toString("utf8")).slice(0, 262144);
     });
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -347,12 +354,15 @@ async function probeCommand(command, versionArgs = ["--version"]) {
     });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
+      const missingOptions = requiredOptions.filter((option) => !output.includes(option));
+      const available = code === 0 && missingOptions.length === 0;
       finish({
-        available: code === 0,
+        available,
         version: truncate(redactSecrets(output).trim(), 300),
         exitCode: code,
         signal,
-        error: code === 0 ? null : truncate(redactSecrets(output).trim(), 500),
+        error: code !== 0 ? truncate(redactSecrets(output).trim(), 500)
+          : missingOptions.length ? `${label} missing required CLI options: ${missingOptions.join(", ")}` : null,
       });
     });
   });
@@ -379,6 +389,17 @@ export class CliAdapter {
 
   async health() {
     const probe = await probeCommand(this.config.command, this.config.versionArgs || ["--version"]);
+    const startupProbe = this.agentId === "tencent-workbuddy" && probe.available
+      ? await probeCommand(this.config.command, this.config.startupProbeArgs || ["--help"], {
+        label: "startup",
+        requiredOptions: ["--model", "--permission-mode", "--tools", "--output-format", ...(this.config.fallbackModel ? ["--fallback-model"] : [])],
+      })
+      : null;
+    if (startupProbe) {
+      probe.available = startupProbe.available;
+      probe.error = startupProbe.error;
+      probe.latencyMs += startupProbe.latencyMs;
+    }
     const capabilityReport = this.agentId === "antigravity"
       ? antigravityCapabilityReport(this.config.permissionMapping || {})
       : this.agentId === "tencent-workbuddy"
@@ -424,6 +445,9 @@ export class CliAdapter {
       ...modelReport,
       ...(providerVersionValidation ? { observedProviderVersion, providerVersionValidation } : {}),
       ...probe,
+      ...(this.agentId === "tencent-workbuddy" ? { startupReadiness: startupProbe
+        ? { available: startupProbe.available, exitCode: startupProbe.exitCode ?? null, error: startupProbe.error, latencyMs: startupProbe.latencyMs }
+        : { available: false, error: "version probe unavailable" } } : {}),
     };
   }
 
@@ -573,6 +597,7 @@ export class CliAdapter {
       const parsed = parseProviderLine(this.agentId, line);
       if (parsed.sessionId) providerSessionId = parsed.sessionId;
       collectProviderFacts(parsed.json, providerFacts);
+      collectProviderDiagnosticLine(this.agentId, line, providerFacts, { stream });
       if (this.agentId === "tencent-workbuddy") {
         collectWorkBuddyProviderFacts(parsed.json, providerFacts, workBuddyToolUses);
       }

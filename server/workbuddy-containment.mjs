@@ -134,6 +134,7 @@ export async function prepareWorkBuddyContainment({
       // WorkBuddy records its provider-managed session JSONL under this
       // project-specific runtime path. It is not the task filesystem scope.
       taskRoot: providerRuntimeRoot,
+      temporaryDirectory: taskDirectory,
       sensitivePathPolicy: effective.sensitivePathPolicy,
     });
     const profilePath = join(taskDirectory, "profile.sb");
@@ -167,6 +168,12 @@ export async function prepareWorkBuddyContainment({
         return ["-f", profilePath, command, ...providerArgs];
       },
       env: {
+        TMPDIR: taskDirectory,
+        TMPPREFIX: join(taskDirectory, "zsh"),
+        // v2.164 otherwise creates ~/.codebuddy/traces/<pid> before model
+        // startup. Disable that optional collector only in this child process;
+        // ACC's durable public event stream remains enabled and authoritative.
+        CODEBUDDY_DISABLE_TRACE_COLLECTOR: "1",
         HTTP_PROXY: `http://localhost:${proxy.port}`,
         HTTPS_PROXY: `http://localhost:${proxy.port}`,
         ALL_PROXY: `http://localhost:${proxy.port}`,
@@ -188,6 +195,8 @@ export async function prepareWorkBuddyContainment({
         providerRuntimeRoot,
         providerRuntimeCleanup: "provider-managed-not-deleted",
         persistentSettingsMutation: false,
+        runtimeTemporaryDirectory: taskDirectory,
+        providerTraceCollection: "disabled-task-env",
         sensitivePathPolicy: effective.sensitivePathPolicy,
         executionProfile: preflight,
       },

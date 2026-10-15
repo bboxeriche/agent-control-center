@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
-import { DEFAULT_SENSITIVE_PATH_PATTERNS, redactSecrets, truncate, emptyProviderFacts, collectProviderFacts, classifyMechanicalOutcome } from "./core.mjs";
+import { DEFAULT_SENSITIVE_PATH_PATTERNS, redactSecrets, truncate, emptyProviderFacts, collectProviderFacts, collectProviderDiagnosticLine, classifyMechanicalOutcome } from "./core.mjs";
 
 export const DELIVERY_CONTRACT_SCHEMA = {
   type: "object", additionalProperties: false,
@@ -149,6 +149,7 @@ export function replayDeliveryDiagnosis(task, events, contract = { type: "final_
   for (const event of events) {
     collector.observe(event.payload?.json, { eventId: event.id, stream: event.stream || "stdout" });
     if (event.stream === "stdout") collectProviderFacts(event.payload?.json, facts);
+    collectProviderDiagnosticLine(task.agent, event.payload?.line, facts, { stream: event.stream, eventId: event.id });
   }
   const blocked = task.permissionPolicy?.executionProfile?.status === "UNSUPPORTED" && !events.some(event => event.eventType === "provider_started");
   const mechanicalOutcome = blocked ? { outcome: "not_started", code: "blocked_preflight", reason: task.permissionPolicy.executionProfile.reason } : classifyMechanicalOutcome({

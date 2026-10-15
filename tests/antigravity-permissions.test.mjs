@@ -133,6 +133,42 @@ test("fails closed for write=true/network=false because the fallback cannot revo
   );
 });
 
+test("public system CA and task-local zsh here-docs work without opening private PEMs or /tmp", async (t) => {
+  if (process.platform !== "darwin") return t.skip("sandbox-exec regression is macOS-specific");
+  const root = mkdtempSync(join(tmpdir(), "acc-ca-temp-"));
+  const scope = join(root, "scope"); mkdirSync(scope);
+  const privatePem = join(scope, "synthetic-private.pem"); writeFileSync(privatePem, "synthetic test data");
+  const containment = await prepareAntigravityContainment({
+    cwd: scope, command: "/bin/zsh",
+    permissionPolicy: { effective: { writeAllowed: false, networkAllowed: true, filesystemScope: [scope] } },
+    config: { taskRoot: join(root, "tasks"), projectsRoot: join(root, "projects") },
+  });
+  const run = (command, args, extra = {}) => spawnSync(containment.sandboxExecutable, ["-f", containment.profilePath, command, ...args], {
+    env: { ...process.env, ...containment.env, ...extra }, encoding: "utf8", timeout: 10000,
+  });
+  try {
+    assert.equal(containment.env.SSL_CERT_FILE, "/etc/ssl/cert.pem");
+    assert.equal(containment.env.REQUESTS_CA_BUNDLE, "/etc/ssl/cert.pem");
+    assert.equal(containment.permissionReceipt.publicCaBundle, "/etc/ssl/cert.pem");
+    const publicCa = run("/usr/bin/stat", ["-f", "%z", "/etc/ssl/cert.pem"]);
+    assert.equal(publicCa.status, 0, publicCa.stderr);
+    assert.notEqual(run("/bin/cat", [privatePem]).status, 0);
+    const payload = "x".repeat(20000);
+    const heredoc = `/bin/cat <<'ACC_EOF'\n${payload}\nACC_EOF\n`;
+    const allowed = run("/bin/zsh", ["-dfc", heredoc]);
+    assert.equal(allowed.status, 0, allowed.stderr);
+    assert.equal(allowed.stdout, payload + "\n");
+    const denied = run("/bin/zsh", ["-dfc", heredoc], { TMPPREFIX: join(root, "outside-zsh") });
+    assert.notEqual(denied.status, 0);
+    assert.match(denied.stderr, /temp file.*operation not permitted/i);
+    const readonly = run("/bin/zsh", ["-dfc", `print changed > ${JSON.stringify(join(scope, "no-write"))}`]);
+    assert.notEqual(readonly.status, 0);
+    assert.equal(existsSync(join(scope, "no-write")), false);
+  } finally {
+    await containment.cleanup("test"); rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("profile has bounded writes and never grants Antigravity settings writes", () => {
   const profile = buildSandboxProfile({
     filesystemScope: [workspace],

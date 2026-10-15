@@ -54,6 +54,10 @@ Provider health is independent: an unavailable provider does not prevent the oth
 
 On macOS, Codex CLI discovery checks the current `ChatGPT.app` / `Codex.app` bundled `codex-cli` layouts and the legacy `Contents/Resources/codex` layout before falling back to `codex` on the service's PATH. Explicit command overrides remain authoritative. This avoids treating a desktop app layout update as a missing CLI or authentication failure.
 
+WorkBuddy discovery prefers an executable standalone `codebuddy` on the service's PATH. A desktop launcher is used only when a full/headless runtime bundle is present; a lite-only desktop distribution is not a working headless CLI. Health checks both `--version` and `--help`, including the required model, permission, tools and output options. A version fast path alone does not establish runtime readiness or authentication. Explicit command overrides remain authoritative.
+
+Contained WorkBuddy runs disable the optional provider trace collector with a child-process-only environment setting rather than granting global `~/.codebuddy/traces` writes. Provider-managed project session files keep their existing boundary; ACC public events and receipts remain enabled. Runtime temporary files use a separate task-local directory, removed on cleanup.
+
 ## Quick start
 
 Prerequisites: Node.js `>=22.5` and the provider CLIs or local endpoints you intend to use.
@@ -95,6 +99,7 @@ Tencent WorkBuddy/CodeBuddy CLI tasks use the same task-scoped containment primi
 - Antigravity currently needs broad provider startup reads; a narrower read boundary causes the provider to abort during startup, so the adapter does not claim one.
 - The bounded-write/no-network Antigravity capability quadrant is unsupported and fails closed during preflight because the headless network tool can escape the child-process path.
 - Sensitive credential-shaped paths (`.env*`, `*.pem`, `*.key`, `credentials*`, and `auth*`) are denied by default inside the external profile. A task-scoped override is available only for a disposable, reviewable scope.
+- The fixed public system CA bundle `/etc/ssl/cert.pem` (including its canonical `/private/etc` alias) is a read-only exception, not a private-key exception. Anti points TLS clients at this public bundle without disabling certificate verification. Here-doc temporary files use a task-local `TMPPREFIX` as well as `TMPDIR`; no global `/tmp` write permission is granted.
 - Provider availability, authentication, model identifiers, and network behavior remain provider-specific. ACC does not make a provider cross-platform or guarantee semantic correctness, prompt-injection resistance, or product acceptance.
 - WorkBuddy external containment is macOS-specific. The HTTP jobs adapter is reported as `http-endpoint-unqualified` because a remote endpoint is outside this local process boundary; it is not reported as locally contained.
 - WorkBuddy's supported network profile uses local `Bash` traffic through the task proxy. Remote provider-side network tools are intentionally excluded rather than represented as task-scoped network capability.
@@ -120,7 +125,13 @@ The durable task contract is:
 
 The same operations are available through the `acc_task_*` MCP tools, including `acc_task_wait`. The `after` query/tool field remains a compatibility alias for `afterCursor`.
 
+Restart recovery runs only after the service successfully binds its listening port. A competing MCP/LaunchAgent startup that fails with `EADDRINUSE` must not mark the owning service's active tasks interrupted.
+
 Task execution defaults to **60 minutes**, configurable with `defaultTimeoutMs`. The per-attempt ceiling is **24 hours**; an explicit shorter `timeoutMs` remains authoritative. Dashboard task creation and completed-task follow-ups expose a minutes field. A follow-up can set a new `timeoutMs` for its next attempt, while an active attempt's timer cannot be extended by a live reply. Stop and cleanup still apply. The separate 60-second client wait ceiling is not the task execution ceiling.
+
+Do not impose a short execution budget merely to bound a client wait: use the bounded wait API for that. Antigravity receives an explicit print timeout within the selected attempt budget. Its native stderr `print timeout ... returning partial output` diagnostic overrides a subsequent `SUCCESS` envelope for mechanical classification: the task is `timed_out`, not successful execution with an empty report. The diagnostic and public evidence are retained. A manual stop cancels the outer watchdog so cleanup cannot turn an earlier stop into a competing timeout; terminal task, event and mechanical status share the same classifier.
+
+An operator may explicitly configure `agents.tencent-workbuddy.fallbackModel`, for example `hy4-preview` with a DeepSeek primary. ACC passes the CLI's native `--fallback-model` only to contained WorkBuddy CLI attempts, including resumes; startup help must advertise support. This is an **overload-only** fallback within the same attempt, permissions and ACC budget, not an ACC task retry or a general recovery for missing modules, TLS errors, permission denial, arbitrary provider errors or absent delivery. Receipts expose the configured fallback separately from provider-reported actual model identity; absent actual identity remains unknown. It is disabled unless explicitly configured.
 
 ### Execution, delivery, and acceptance
 

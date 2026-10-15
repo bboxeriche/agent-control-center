@@ -189,6 +189,7 @@ test("keeps WorkBuddy permission profiles unverified until a fresh matching vers
   config.maxConcurrentTasks = 0;
   config.allowedRoots = [process.cwd()];
   config.agents["tencent-workbuddy"].versionArgs = ["-e", "process.stdout.write('codebuddy 2.156.0')"];
+  config.agents["tencent-workbuddy"].startupProbeArgs = ["-e", "process.stdout.write('--model --permission-mode --tools --output-format')"];
   const plane = new ControlPlane({ dataDir, config });
   try {
     const unchecked = plane.previewTaskPolicy({ agent: "tencent-workbuddy", cwd: process.cwd() });

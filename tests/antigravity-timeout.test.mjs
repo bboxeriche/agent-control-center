@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { CliAdapter } from "../server/adapters.mjs";
-import { defaultConfig } from "../server/core.mjs";
+import { collectProviderDiagnosticLine, defaultConfig, emptyProviderFacts } from "../server/core.mjs";
+import { replayDeliveryDiagnosis } from "../server/delivery.mjs";
 import { ControlPlane } from "../server/service.mjs";
 
 const fixture = join(process.cwd(), "tests", "fixtures", "fake-agent.mjs");
@@ -99,4 +100,65 @@ test("does not add Antigravity print timeout flags to WorkBuddy, Codex, or Claud
     assert.equal(handle.args.includes("--print-timeout"), false, `${agentId} args must remain unchanged`);
     await handle.wait;
   }
+});
+
+const timeoutWarning = "[agy] print timeout after 7m36s with turn in progress; returning partial output";
+
+test("native print timeout followed by empty SUCCESS is timed_out in task, summary, and event", async () => {
+  const config = defaultConfig();
+  config.agents.antigravity = {
+    ...config.agents.antigravity, command: process.execPath,
+    args: ["-e", `console.error(${JSON.stringify(timeoutWarning)});console.log(JSON.stringify({event:'result',result:{status:'SUCCESS',response:''}}))`, "--"],
+    permissionMapping: { strategy: "test-double" },
+  };
+  const plane = new ControlPlane({ dataDir: await mkdtemp(join(tmpdir(), "acc-inner-timeout-")), config });
+  try {
+    const task = plane.createTask({ agent: "antigravity", cwd: process.cwd(), prompt: "native timeout fixture" });
+    const finished = await plane.waitForTask(task.id, 5000);
+    assert.equal(finished.status, "timed_out");
+    assert.equal(finished.metadata.mechanicalOutcome.code, "provider_print_timeout");
+    assert.equal(finished.metadata.providerFacts.providerTimeout.duration, "7m36s");
+    assert.equal(finished.metadata.providerFinalAnswer, null);
+    assert.equal(finished.metadata.deliveryOutcome.outcome, "not_completed");
+    assert.match(finished.errorText, /print timeout/);
+    assert.equal(plane.listTaskEvents(task.id).find(e => e.eventType === "task_finished").payload.status, "timed_out");
+    const replay = replayDeliveryDiagnosis(finished, plane.listTaskEvents(task.id));
+    assert.equal(replay.mechanicalOutcome.outcome, "timed_out");
+    // Original successful-empty history gets a sidecar diagnosis, not mutation.
+    const old = { ...finished, status: "completed_without_delivery", errorText: null };
+    const before = JSON.stringify(old);
+    const diagnosis = replayDeliveryDiagnosis(old, plane.listTaskEvents(task.id));
+    assert.equal(diagnosis.mechanicalOutcome.code, "provider_print_timeout");
+    assert.equal(JSON.stringify(old), before);
+    assert.ok(diagnosis.mechanicalOutcome.evidence.providerTimeout.eventId);
+  } finally { await plane.shutdown(); }
+});
+
+test("timeout-looking stdout, tool text, unrelated stderr and other providers do not set a timeout", () => {
+  for (const [agent, stream, line] of [
+    ["antigravity", "stdout", timeoutWarning],
+    ["tencent-workbuddy", "stderr", timeoutWarning],
+    ["antigravity", "stderr", "quoted: " + timeoutWarning],
+    ["antigravity", "stderr", JSON.stringify({ tool_output: timeoutWarning })],
+    ["antigravity", "stderr", "request timed out"],
+  ]) {
+    const facts = collectProviderDiagnosticLine(agent, line, emptyProviderFacts(), { stream });
+    assert.equal(facts.providerTimeout, null);
+  }
+});
+
+test("manual stop during slow cleanup cannot become a watchdog timeout", async () => {
+  const config = defaultConfig();
+  config.agents["claude-code"] = { ...config.agents["claude-code"], command: process.execPath,
+    args: ["-e", "process.on('SIGTERM',()=>setTimeout(()=>process.exit(0),1600));setInterval(()=>{},1000)"] };
+  const plane = new ControlPlane({ dataDir: await mkdtemp(join(tmpdir(), "acc-stop-deadline-")), config });
+  try {
+    const task = plane.createTask({ agent: "claude-code", cwd: process.cwd(), prompt: "stop race fixture", timeoutMs: 1000 });
+    while (!plane.runtime.get(task.id)?.handle) await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const finished = await plane.stopTask(task.id);
+    assert.equal(finished.status, "stopped");
+    assert.equal(finished.metadata.mechanicalOutcome.outcome, "stopped");
+    assert.equal(finished.errorText, "task stopped");
+  } finally { await plane.shutdown(); }
 });

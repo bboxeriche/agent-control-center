@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   WORKBUDDY_CONTAINMENT_STRATEGY,
   WORKBUDDY_CONTAINED_TOOLS,
@@ -198,14 +198,24 @@ export function workBuddyCliCandidates() {
   ]);
 }
 
-export function discoverWorkBuddyCli() {
-  const bundled = workBuddyCliCandidates().find((candidate) => {
+export function discoverWorkBuddyCli({ candidates = workBuddyCliCandidates(), searchPath = process.env.PATH || "" } = {}) {
+  const executable = (candidate) => {
     try {
+      accessSync(candidate, constants.X_OK);
       return statSync(candidate).isFile();
     } catch {
       return false;
     }
-  });
+  };
+  // New desktop distributions can contain only a lite UI bundle. Prefer the
+  // standalone CLI on PATH; a desktop launcher file alone is not a CLI runtime.
+  const standalone = searchPath.split(delimiter).filter(isAbsolute)
+    .map((directory) => join(directory, "codebuddy"))
+    .find((candidate) => !candidates.includes(candidate) && executable(candidate));
+  if (standalone) return standalone;
+  const bundled = candidates.find((candidate) => executable(candidate)
+    && ["codebuddy.js", "codebuddy.cjs", "codebuddy-headless.js", "codebuddy-headless.cjs"]
+      .some((entry) => existsSync(join(dirname(candidate), "..", "dist", entry))));
   return bundled || "codebuddy";
 }
 
@@ -743,6 +753,7 @@ export function emptyProviderFacts() {
     deniedActions: [],
     structuredToolErrors: [],
     actualModel: null,
+    providerTimeout: null,
   };
 }
 
@@ -825,6 +836,21 @@ export function collectProviderFacts(value, facts = emptyProviderFacts(), depth 
   return facts;
 }
 
+// An agy runtime diagnostic, not model text or a tool's quoted output. Keep
+// recognition anchored to the provider's stderr protocol and preserve evidence.
+export function collectProviderDiagnosticLine(agent, line, facts = emptyProviderFacts(), { stream, eventId = null } = {}) {
+  if (agent !== "antigravity" || stream !== "stderr") return facts;
+  const match = String(line || "").match(/^\[agy\] print timeout after ((?:\d+(?:\.\d+)?(?:ms|ns|us|µs|μs|h|m|s))+) with turn in progress; returning partial output$/);
+  if (match) facts.providerTimeout = {
+    code: "antigravity_print_timeout",
+    source: "stderr",
+    duration: match[1],
+    message: boundedFactText(line),
+    ...(eventId === null ? {} : { eventId }),
+  };
+  return facts;
+}
+
 export function classifyMechanicalOutcome({
   result = {},
   providerFacts = emptyProviderFacts(),
@@ -849,6 +875,7 @@ export function classifyMechanicalOutcome({
     deniedActions: facts.deniedActions,
     structuredToolErrors: facts.structuredToolErrors,
     actualModel: facts.actualModel || null,
+    providerTimeout: facts.providerTimeout || null,
     containmentError: containmentError
       ? { code: containmentError.code || null, message: boundedFactText(containmentError.message || containmentError) }
       : null,
@@ -868,6 +895,7 @@ export function classifyMechanicalOutcome({
   }
   if (facts.deniedActions.length) return { outcome: "failed", code: "provider_denied_actions", reason: `provider denied actions: ${facts.deniedActions.join(", ")}`, evidence };
   if (facts.structuredToolErrors.length) return { outcome: "failed", code: "provider_structured_tool_error", reason: "provider reported structured tool errors", evidence };
+  if (facts.providerTimeout) return { outcome: "timed_out", code: "provider_print_timeout", reason: facts.providerTimeout.message, evidence };
   if (failedStatus) return { outcome: "failed", code: "provider_status_failed", reason: `provider reported status ${failedStatus}`, evidence };
   if (result?.exitCode !== undefined && result?.exitCode !== null && result.exitCode !== 0) {
     return { outcome: "failed", code: "provider_exit_nonzero", reason: `provider exited with code ${result.exitCode}`, evidence };

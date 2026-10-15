@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { CliAdapter } from "../server/adapters.mjs";
+import { CliAdapter, commandArgs } from "../server/adapters.mjs";
 import { networkTargetAllowed } from "../server/antigravity-containment.mjs";
 import { defaultConfig, discoverWorkBuddyCli, workBuddyCliCandidates, classifyMechanicalOutcome } from "../server/core.mjs";
 import { ControlPlane } from "../server/service.mjs";
@@ -20,11 +20,23 @@ import { tmpdir } from "node:os";
 
 const fixture = join(process.cwd(), "tests", "fixtures", "fake-agent.mjs");
 
-test("discovers the bundled WorkBuddy CLI when it is installed outside PATH", () => {
-  const bundled = workBuddyCliCandidates().find((candidate) => existsSync(candidate)) || "codebuddy";
-  const discovered = discoverWorkBuddyCli();
-  assert.equal(discovered, bundled);
-  assert.equal(defaultConfig().agents["tencent-workbuddy"].command, discovered);
+test("prefers a standalone WorkBuddy CLI and skips lite-only desktop layouts", () => {
+  const root = mkdtempSync(join(tmpdir(), "acc-wb-discovery-"));
+  try {
+    const bin = join(root, "standalone");
+    const app = join(root, "desktop");
+    mkdirSync(bin); mkdirSync(join(app, "bin"), { recursive: true }); mkdirSync(join(app, "dist"));
+    const standalone = join(bin, "codebuddy");
+    const bundled = join(app, "bin", "codebuddy");
+    writeFileSync(standalone, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(bundled, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(app, "dist", "codebuddy-lite-wb.mjs"), "");
+    assert.equal(discoverWorkBuddyCli({ candidates: [bundled], searchPath: bin }), standalone);
+    assert.equal(discoverWorkBuddyCli({ candidates: [bundled], searchPath: "" }), "codebuddy");
+    writeFileSync(join(app, "dist", "codebuddy-headless.js"), "");
+    assert.equal(discoverWorkBuddyCli({ candidates: [bundled], searchPath: "" }), bundled);
+    assert.equal(defaultConfig().agents["tencent-workbuddy"].command, discoverWorkBuddyCli());
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("permits the current WorkBuddy provider origin without granting task network access", () => {
@@ -43,6 +55,7 @@ test("marks WorkBuddy permission profiles unverified when the observed CLI versi
     ...config,
     command: process.execPath,
     versionArgs: ["-e", "process.stdout.write('codebuddy 2.156.0')"],
+    startupProbeArgs: ["-e", "process.stdout.write('--model --permission-mode --tools --output-format')"],
   });
   const health = await adapter.health();
   assert.equal(health.available, true);
@@ -52,6 +65,29 @@ test("marks WorkBuddy permission profiles unverified when the observed CLI versi
   for (const profile of Object.values(health.capabilityReport.executionProfiles)) {
     assert.notEqual(profile.status, "SUPPORTED");
   }
+});
+
+test("does not report WorkBuddy available when version works but runtime bootstrap fails", async () => {
+  const adapter = new CliAdapter("tencent-workbuddy", {
+    ...defaultConfig().agents["tencent-workbuddy"], command: process.execPath,
+    versionArgs: ["-e", "console.log('2.161.0')"],
+    startupProbeArgs: ["-e", "console.error(\"Cannot find module '../dist/codebuddy'\");process.exit(1)"],
+  });
+  const health = await adapter.health();
+  assert.equal(health.available, false);
+  assert.equal(health.version, "2.161.0");
+  assert.equal(health.startupReadiness.available, false);
+  assert.match(health.error, /Cannot find module/);
+});
+
+test("requires the headless permission and output options in WorkBuddy startup help", async () => {
+  const adapter = new CliAdapter("tencent-workbuddy", {
+    command: process.execPath, versionArgs: ["-e", "console.log('2.161.0')"],
+    startupProbeArgs: ["-e", "console.log('lite help --model')"],
+  });
+  const health = await adapter.health();
+  assert.equal(health.available, false);
+  assert.match(health.error, /--permission-mode/);
 });
 
 test("appends a requested model and uses the WorkBuddy resume template", async () => {
@@ -68,6 +104,27 @@ test("appends a requested model and uses the WorkBuddy resume template", async (
   const resumed = adapter.start({ prompt: "follow-up smoke", cwd: process.cwd(), model: "HY4", sessionId: "session-1" }, () => {});
   assert.deepEqual(resumed.args, [fixture, "-p", "follow-up smoke", "--resume", "session-1", "--model", "HY4"]);
   await resumed.wait;
+});
+
+test("explicit WorkBuddy overload fallback keeps the same invocation and permissions on initial/resume", () => {
+  const config = {
+    command: process.execPath, args: [fixture, "-p", "{prompt}"],
+    resumeArgs: [fixture, "-p", "{prompt}", "--resume", "{sessionId}"], supportsResume: true,
+    modelArgs: ["--model", "{model}"], fallbackModel: "hy4-preview",
+    permissionMapping: { strategy: WORKBUDDY_CONTAINMENT_STRATEGY, nativePermissionMode: "bypassPermissions" },
+  };
+  for (const sessionId of [null, "existing-session"]) {
+    const spec = { prompt: "fallback fixture", cwd: process.cwd(), model: "deepseek-v4.1-flash", sessionId,
+      timeoutMs: 5000, permissionPolicy: { effective: { writeAllowed: false, networkAllowed: false, filesystemScope: [process.cwd()] } } };
+    const args = commandArgs(config, spec);
+    assert.equal(args[args.indexOf("--fallback-model") + 1], "hy4-preview");
+    assert.equal(args[args.indexOf("--permission-mode") + 1], "bypassPermissions");
+    assert.equal(args[args.indexOf("--model") + 1], "deepseek-v4.1-flash");
+    assert.equal(args.includes("--resume"), Boolean(sessionId));
+    assert.equal(spec.timeoutMs, 5000);
+    assert.equal(spec.permissionPolicy.effective.networkAllowed, false);
+    assert.equal(commandArgs({ ...config, fallbackModel: null }, spec).includes("--fallback-model"), false);
+  }
 });
 
 test("treats a structured provider error as failed even when the CLI exits zero", async () => {

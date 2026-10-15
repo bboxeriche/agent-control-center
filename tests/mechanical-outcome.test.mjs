@@ -44,6 +44,16 @@ test("classifies containment cleanup failure and nonzero exit deterministically"
   assert.equal(nonzero.code, "provider_exit_nonzero");
 });
 
+test("timeout and stop precedence is explicit while cleanup failure remains authoritative", () => {
+  const facts = { ...emptyProviderFacts(), providerTimeout: { code: "antigravity_print_timeout", message: "partial output" } };
+  assert.equal(classifyMechanicalOutcome({ providerFacts: facts, result: { exitCode: 0 } }).outcome, "timed_out");
+  assert.equal(classifyMechanicalOutcome({ providerFacts: facts, stopRequested: true }).outcome, "stopped");
+  assert.equal(classifyMechanicalOutcome({ providerFacts: { ...facts, deniedActions: ["command"] } }).code, "provider_denied_actions");
+  assert.equal(classifyMechanicalOutcome({ timedOut: true, stopRequested: true }).outcome, "timed_out");
+  assert.equal(classifyMechanicalOutcome({ providerFacts: facts, timedOut: true,
+    result: { permissionCleanup: { state: "failed", error: "cleanup failure" } } }).outcome, "failed");
+});
+
 test("defaults sensitive paths to deny and requires an explicit per-task override", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "acc-sensitive-policy-"));
   const config = defaultConfig();

@@ -61,6 +61,19 @@ test("serves health, task creation, task status, and dashboard", async () => {
   }
 });
 
+test("a competing startup cannot interrupt the live owner's tasks before EADDRINUSE", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "acc-startup-owner-"));
+  const config = fakeConfig(); config.maxConcurrentTasks = 0;
+  const running = await startControlServer({ host: "127.0.0.1", port: 0, dataDir, config });
+  try {
+    const task = running.plane.createTask({ agent: "claude-code", prompt: "queued owner fixture", cwd: process.cwd() });
+    const before = running.plane.getTask(task.id);
+    await assert.rejects(startControlServer({ host: running.host, port: running.port, dataDir, config }), error => error.code === "EADDRINUSE");
+    assert.deepEqual(running.plane.getTask(task.id), before);
+    assert.equal(running.plane.getTask(task.id).status, "queued");
+  } finally { await running.close(); }
+});
+
 test("streams authenticated lifecycle invalidations without provider output and removes disconnected listeners", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "acc-dashboard-activity-"));
   const running = await startControlServer({ host: "127.0.0.1", port: 0, dataDir, config: fakeConfig() });

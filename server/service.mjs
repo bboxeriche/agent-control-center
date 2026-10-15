@@ -140,10 +140,10 @@ function discussionAgentNames(config, requested) {
 }
 
 function terminalStatusForResult(result, runtime, mechanicalOutcome = null, deliveryOutcome = null) {
-  if (runtime.stopRequested) return "stopped";
+  if (["failed", "stopped", "timed_out"].includes(mechanicalOutcome?.outcome)) return mechanicalOutcome.outcome;
   if (runtime.timedOut) return "timed_out";
+  if (runtime.stopRequested) return "stopped";
   if (result?.stopRequested) return "stopped";
-  if (mechanicalOutcome?.outcome === "failed") return "failed";
   if (result?.error || result?.exitCode !== 0) return "failed";
   if (deliveryOutcome?.outcome?.startsWith("missing_")) return "completed_without_delivery";
   return "succeeded";
@@ -217,7 +217,7 @@ function taskResultSummary(task) {
 }
 
 export class ControlPlane {
-  constructor({ dataDir = resolveDataDir(), config = null } = {}) {
+  constructor({ dataDir = resolveDataDir(), config = null, recoverActiveTasks = true } = {}) {
     this.dataDir = ensureDir(dataDir);
     this.authToken = ensureAuthToken(this.dataDir);
     this.store = new Store(this.dataDir);
@@ -231,7 +231,7 @@ export class ControlPlane {
     this.queue = [];
     this.stoppedDiscussions = new Set();
     this.activeCount = 0;
-    this.store.recoverActiveTasks();
+    if (recoverActiveTasks) this.store.recoverActiveTasks();
   }
 
   emit(input) {
@@ -532,6 +532,7 @@ export class ControlPlane {
       });
       const timeoutPromise = new Promise((resolve) => {
         runtime.timeoutTimer = setTimeout(() => {
+          if (runtime.stopRequested) return;
           runtime.timedOut = true;
           void (async () => {
             try {
@@ -592,10 +593,9 @@ export class ControlPlane {
     });
     const deliveryOutcome = assessDelivery({ contract: deliveryContract, finalAnswer: runtime.providerFinalAnswer, mechanicalOutcome, before: deliveryBefore, files: snapshotDeliveryFiles(deliveryContract, task.permissionPolicy) });
     const finalStatus = terminalStatusForResult(result, runtime, mechanicalOutcome, deliveryOutcome);
-    const errorText = runtime.timedOut
-      ? "task timed out"
-      : result?.error
-        || (mechanicalOutcome.outcome === "failed" ? truncate(mechanicalOutcome.reason, 4000) : finalStatus === "failed" ? truncate(result?.stderr || "provider exited with an error", 4000) : null);
+    const errorText = mechanicalOutcome.outcome !== "succeeded"
+      ? truncate(mechanicalOutcome.reason, 4000)
+      : result?.error || (finalStatus === "failed" ? truncate(result?.stderr || "provider exited with an error", 4000) : null);
     const providerFacts = result?.providerFacts || runtime.providerFacts;
     const metadata = {
       ...task.metadata,
@@ -754,7 +754,8 @@ export class ControlPlane {
     }
     const runtime = this.runtime.get(id);
     if (!runtime?.handle) throw new Error(`task is not controllable at the moment: ${id}`);
-    runtime.stopRequested = true;
+    if (!runtime.timedOut) runtime.stopRequested = true;
+    clearTimeout(runtime.timeoutTimer);
     this.emit({ taskId: id, eventType: "stop_requested", source: "control-plane", payload: { taskId: id } });
     await runtime.handle.stop();
     try {
@@ -1218,7 +1219,8 @@ export class ControlPlane {
     }
     const active = [...this.runtime.entries()];
     await Promise.all(active.map(async ([id, runtime]) => {
-      runtime.stopRequested = true;
+      if (!runtime.timedOut) runtime.stopRequested = true;
+      clearTimeout(runtime.timeoutTimer);
       try {
         await runtime.handle?.stop?.();
       } catch {
@@ -1477,12 +1479,21 @@ export function createRequestHandler(plane) {
 }
 
 export async function startControlServer({ host, port, dataDir, config } = {}) {
-  const plane = new ControlPlane({ dataDir, config });
+  // Binding establishes ownership. A losing MCP/LaunchAgent startup must not
+  // reclassify the winner's live tasks before it discovers EADDRINUSE.
+  const plane = new ControlPlane({ dataDir, config, recoverActiveTasks: false });
   const server = createServer(createRequestHandler(plane));
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port ?? plane.config.port ?? DEFAULT_PORT, host ?? plane.config.host ?? DEFAULT_HOST, resolve);
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port ?? plane.config.port ?? DEFAULT_PORT, host ?? plane.config.host ?? DEFAULT_HOST, resolve);
+    });
+    plane.store.recoverActiveTasks();
+  } catch (error) {
+    if (server.listening) await new Promise(resolve => server.close(resolve));
+    plane.store.close();
+    throw error;
+  }
   const address = server.address();
   return {
     plane,
