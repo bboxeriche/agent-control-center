@@ -90,6 +90,16 @@ test("requires the headless permission and output options in WorkBuddy startup h
   assert.match(health.error, /--permission-mode/);
 });
 
+test("gives WorkBuddy startup its own budget instead of the three-second version fast path", async () => {
+  const adapter = new CliAdapter("tencent-workbuddy", {
+    command: process.execPath, versionArgs: ["-e", "console.log('2.164.0')"],
+    startupProbeArgs: ["-e", "setTimeout(()=>console.log('--model --permission-mode --tools --output-format'),3100)"],
+  });
+  const health = await adapter.health();
+  assert.equal(health.available, true);
+  assert.ok(health.startupReadiness.latencyMs >= 3100);
+});
+
 test("appends a requested model and uses the WorkBuddy resume template", async () => {
   const adapter = new CliAdapter("tencent-workbuddy", {
     command: process.execPath,

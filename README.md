@@ -56,6 +56,8 @@ On macOS, Codex CLI discovery checks the current `ChatGPT.app` / `Codex.app` bun
 
 WorkBuddy discovery prefers an executable standalone `codebuddy` on the service's PATH. A desktop launcher is used only when a full/headless runtime bundle is present; a lite-only desktop distribution is not a working headless CLI. Health checks both `--version` and `--help`, including the required model, permission, tools and output options. A version fast path alone does not establish runtime readiness or authentication. Explicit command overrides remain authoritative.
 
+The fast version probe has a three-second budget; full WorkBuddy startup has a separate ten-second budget. A startup timeout remains an explicit unavailable/timeout receipt, not evidence that the CLI or a model was missing.
+
 Contained WorkBuddy runs disable the optional provider trace collector with a child-process-only environment setting rather than granting global `~/.codebuddy/traces` writes. Provider-managed project session files keep their existing boundary; ACC public events and receipts remain enabled. Runtime temporary files use a separate task-local directory, removed on cleanup.
 
 ## Quick start

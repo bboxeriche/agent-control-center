@@ -321,7 +321,7 @@ function collectWorkBuddyProviderFacts(value, facts, toolUses = new Map(), depth
   return facts;
 }
 
-async function probeCommand(command, versionArgs = ["--version"], { label = "version", requiredOptions = [] } = {}) {
+async function probeCommand(command, versionArgs = ["--version"], { label = "version", requiredOptions = [], timeoutMs = 3000 } = {}) {
   const startedAt = Date.now();
   return new Promise((resolve) => {
     let settled = false;
@@ -341,7 +341,7 @@ async function probeCommand(command, versionArgs = ["--version"], { label = "ver
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
       finish({ available: false, error: `${label} probe timed out` });
-    }, 3000);
+    }, timeoutMs);
     child.stdout.on("data", (chunk) => {
       output = (output + chunk.toString("utf8")).slice(0, 262144);
     });
@@ -392,6 +392,7 @@ export class CliAdapter {
     const startupProbe = this.agentId === "tencent-workbuddy" && probe.available
       ? await probeCommand(this.config.command, this.config.startupProbeArgs || ["--help"], {
         label: "startup",
+        timeoutMs: 10000,
         requiredOptions: ["--model", "--permission-mode", "--tools", "--output-format", ...(this.config.fallbackModel ? ["--fallback-model"] : [])],
       })
       : null;
